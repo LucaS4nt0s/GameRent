@@ -1,0 +1,30 @@
+services:
+  catalog-service:
+    build:
+      context: ./services/catalog-service
+      dockerfile: Dockerfile
+    container_name: gamerent-catalog
+    ports:
+      - "8001:8001"
+    networks:
+      - gamerent-net
+    restart: unless-stopped
+
+  rental-service:
+    build:
+      context: ./services/rental-service
+      dockerfile: Dockerfile
+    container_name: gamerent-rental
+    ports:
+      - "8002:8002"
+    environment:
+      - CATALOG_SERVICE_URL=http://catalog-service:8001
+    depends_on:
+      - catalog-service
+    networks:
+      - gamerent-net
+    restart: unless-stopped
+
+networks:
+  gamerent-net:
+    driver: bridge
