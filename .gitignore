@@ -57,3 +57,6 @@ Trabalho Prático - Sistemas Distribuídos.pdf
 *Trabalho Prático*Sistemas Distribu*dos.pdf
 relatorio-tecnico-gamerent_entrega.pdf
 *.pdf
+
+# Mantém os relatórios oficiais de entrega versionados em docs/
+!docs/*.pdf
