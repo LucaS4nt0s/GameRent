@@ -60,3 +60,14 @@ relatorio-tecnico-gamerent_entrega.pdf
 
 # Mantém os relatórios oficiais de entrega versionados em docs/
 !docs/*.pdf
+
+# Relatórios em Markdown e imagens/diagramas locais (para enviar apenas o PDF final)
+docs/relatorio-entrega-2.md
+relatorio-entrega-*.md
+docs/diagrams/*
+!docs/diagrams/.gitkeep
+docs/*.png
+docs/*.jpg
+docs/*.jpeg
+docs/*.webp
+

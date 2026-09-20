@@ -55,7 +55,6 @@ Os serviços estarão disponíveis em:
 ## ☁️ Implantação na Nuvem (AWS)
 
 * **Provedor:** Amazon Web Services (AWS)
-* **Serviço de Computação:** AWS EC2 (t2.micro / Ubuntu Server)
-* **Endereço Público:** `http://<IP-PUBLICO-AWS>:8001` e `http://<IP-PUBLICO-AWS>:8002`
+* **Serviço de Computação:** AWS EC2 (t3.micro / Ubuntu Server)
+* **Endereço Público:** `http://18.231.180.197:8001` e `http://18.231.180.197:8002`
 
-Consulte o arquivo [passoapasso.md](file:///C:/GameRent/passoapasso.md) para o guia detalhado de implantação e submissão.

@@ -121,7 +121,6 @@ def run_tests(host: str, catalog_port: int, rental_port: int):
 
     print_section("RESUMO DOS TESTES")
     print("🎉 Todos os testes de comunicação inter-serviços foram executados!")
-    print("Capture esses outputs para anexar como evidência no relatório da Entrega 2.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Teste de Comunicação GameRent")
