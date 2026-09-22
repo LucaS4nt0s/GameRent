@@ -49,6 +49,7 @@ docker compose up --build
 Os serviços estarão disponíveis em:
 * Catálogo: `http://localhost:8001` (Docs Swagger em `http://localhost:8001/docs`)
 * Reservas: `http://localhost:8002` (Docs Swagger em `http://localhost:8002/docs`)
+* Frontend: `http://localhost:8080` (Docs Swagger em `http://localhost:8080`)
 
 ---
 
@@ -56,5 +57,5 @@ Os serviços estarão disponíveis em:
 
 * **Provedor:** Amazon Web Services (AWS)
 * **Serviço de Computação:** AWS EC2 (t3.micro / Ubuntu Server)
-* **Endereço Público:** `http://18.231.180.197:8001` e `http://18.231.180.197:8002`
+* **Endereço Público:** `http://18.231.180.197:8001`, `http://18.231.180.197:8002` e `http://18.231.180.197:8001`
 
