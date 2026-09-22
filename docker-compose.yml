@@ -25,6 +25,20 @@ services:
       - gamerent-net
     restart: unless-stopped
 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: gamerent-frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - catalog-service
+      - rental-service
+    networks:
+      - gamerent-net
+    restart: unless-stopped
+
 networks:
   gamerent-net:
     driver: bridge
