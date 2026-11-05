@@ -1,9 +1,20 @@
 import logging
+import os
+import threading
+from datetime import datetime, timezone
+from decimal import Decimal
 from typing import List, Optional
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
-from models import Game, GameStatus, GamePublicResponse, GameNearbyResponse, StatusUpdatePayload
+from models import (
+    Game,
+    GameCreateRequest,
+    GameNearbyResponse,
+    GamePublicResponse,
+    GameStatus,
+    StatusUpdatePayload,
+)
 from geo_utils import calculate_haversine_distance
 
 # Configuração de Logs
@@ -27,6 +38,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_clock_lock = threading.Lock()
+_lamport_clock = 0
+
+
+def tick_lamport(incoming: Optional[int] = None) -> int:
+    global _lamport_clock
+    with _clock_lock:
+        if incoming is not None:
+            _lamport_clock = max(_lamport_clock, incoming) + 1
+        else:
+            _lamport_clock += 1
+        return _lamport_clock
+
+
 # Base de dados em memória inicial (Jogos de Tabuleiro)
 GAMES_DB: dict[int, Game] = {
     1: Game(
@@ -39,7 +64,7 @@ GAMES_DB: dict[int, Game] = {
         owner_id="locador-001",
         owner_name="Ana Paula",
         latitude=-23.5505,
-        longitude=-46.6333 # Região Central de SP
+        longitude=-46.6333  # Região Central de SP
     ),
     2: Game(
         id=2,
@@ -51,7 +76,7 @@ GAMES_DB: dict[int, Game] = {
         owner_id="locador-002",
         owner_name="Carlos Eduardo",
         latitude=-23.5615,
-        longitude=-46.6560 # Av. Paulista
+        longitude=-46.6560  # Av. Paulista
     ),
     3: Game(
         id=3,
@@ -71,11 +96,11 @@ GAMES_DB: dict[int, Game] = {
         description="Aventura ferroviária conectando cidades pelo continente.",
         category="Familiar",
         price_per_day=18.0,
-        status=GameStatus.RENTED, # Inicialmente já locado para testes de conflito
+        status=GameStatus.RENTED,  # Inicialmente já locado para testes de conflito
         owner_id="locador-003",
         owner_name="Mariana Souza",
         latitude=-23.5874,
-        longitude=-46.6795 # Itaim Bibi
+        longitude=-46.6795  # Itaim Bibi
     ),
     5: Game(
         id=5,
@@ -91,23 +116,129 @@ GAMES_DB: dict[int, Game] = {
     )
 }
 
+_ddb_table = None
+
+
+def _get_ddb_table():
+    """Conecta à tabela gamerent_games no DynamoDB se configurado/disponível."""
+    global _ddb_table
+    if _ddb_table is not None:
+        return _ddb_table
+    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL")
+    use_ddb = os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") or bool(endpoint)
+    if not use_ddb:
+        return None
+    try:
+        import boto3
+        region = os.getenv("AWS_REGION", "sa-east-1")
+        ddb = boto3.resource(
+            "dynamodb",
+            region_name=region,
+            endpoint_url=endpoint,
+            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "test"),
+            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
+        )
+        table_name = os.getenv("GAMES_TABLE_NAME", "gamerent_games")
+        existing = [t.name for t in ddb.tables.all()]
+        if table_name not in existing:
+            table = ddb.create_table(
+                TableName=table_name,
+                KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+                AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "N"}],
+                BillingMode="PAY_PER_REQUEST",
+            )
+            table.wait_until_exists()
+        else:
+            table = ddb.Table(table_name)
+
+        if table.item_count == 0 and not table.scan(Limit=1).get("Items"):
+            for g in GAMES_DB.values():
+                _put_ddb_game(table, g)
+        _ddb_table = table
+        return _ddb_table
+    except Exception as exc:
+        logger.warning(f"DynamoDB indisponível, operando com GAMES_DB em memória: {exc}")
+        return None
+
+
+def _put_ddb_game(table, game: Game) -> None:
+    data = game.model_dump()
+    data["status"] = game.status.value
+    for k in ("price_per_day", "latitude", "longitude"):
+        data[k] = Decimal(str(data[k]))
+    table.put_item(Item=data)
+
+
+def _save_game(game: Game) -> Game:
+    GAMES_DB[game.id] = game
+    table = _get_ddb_table()
+    if table is not None:
+        try:
+            _put_ddb_game(table, game)
+        except Exception as exc:
+            logger.warning(f"Falha ao persistir jogo {game.id} no DynamoDB: {exc}")
+    return game
+
+
 @app.get("/health", tags=["Monitoramento"])
 def health_check():
     """Endpoint de integridade para monitoramento (Health Check)."""
     return {
         "status": "HEALTHY",
         "service": "catalog-service",
-        "total_games": len(GAMES_DB)
+        "total_games": len(GAMES_DB),
+        "lamport_clock": _lamport_clock
     }
 
+
+@app.post("/games", response_model=GamePublicResponse, status_code=status.HTTP_201_CREATED, tags=["Catálogo"])
+def create_game(
+    payload: GameCreateRequest,
+    response: Response,
+    x_lamport_clock: Optional[int] = Header(default=None)
+):
+    """
+    FA-01: Cadastra um novo jogo de tabuleiro pelo locador.
+    Salva latitude/longitude de forma privada sem expô-las no payload público,
+    gera URNs padronizados e incrementa o Relógio Lógico de Lamport.
+    """
+    clock = tick_lamport(x_lamport_clock)
+    response.headers["X-Lamport-Clock"] = str(clock)
+
+    new_id = max(GAMES_DB.keys(), default=0) + 1
+    new_game = Game(
+        id=new_id,
+        urn=f"urn:gamerent:game:sa-east-1:{new_id}",
+        title=payload.title,
+        description=payload.description,
+        category=payload.category,
+        price_per_day=payload.price_per_day,
+        status=GameStatus.AVAILABLE,
+        owner_id=payload.owner_id,
+        owner_urn=f"urn:gamerent:owner:{payload.owner_id}",
+        owner_name=payload.owner_name,
+        latitude=payload.latitude,
+        longitude=payload.longitude,
+        version=1,
+        lamport_clock=clock,
+        updated_at=datetime.now(timezone.utc).isoformat()
+    )
+    _save_game(new_game)
+    logger.info(f"[LAMPORT={clock}] Novo jogo cadastrado: ID={new_id}, URN={new_game.urn}")
+    return GamePublicResponse(**new_game.model_dump())
+
+
 @app.get("/games", response_model=List[GamePublicResponse], tags=["Catálogo"])
-def list_games(status_filter: Optional[GameStatus] = None):
+def list_games(status_filter: Optional[GameStatus] = None, owner_id: Optional[str] = None):
     """Lista todos os jogos, omitindo coordenadas sensíveis de GPS."""
     logger.info("Listagem de jogos solicitada.")
     games = list(GAMES_DB.values())
     if status_filter:
         games = [g for g in games if g.status == status_filter]
+    if owner_id:
+        games = [g for g in games if g.owner_id == owner_id]
     return [GamePublicResponse(**g.model_dump()) for g in games]
+
 
 @app.get("/games/nearby", response_model=List[GameNearbyResponse], tags=["Catálogo"])
 def list_nearby_games(
@@ -127,19 +258,14 @@ def list_nearby_games(
         if dist <= max_km:
             results.append(
                 GameNearbyResponse(
-                    id=game.id,
-                    title=game.title,
-                    description=game.description,
-                    category=game.category,
-                    price_per_day=game.price_per_day,
-                    status=game.status,
-                    owner_name=game.owner_name,
+                    **game.model_dump(),
                     distance_km=dist
                 )
             )
 
     results.sort(key=lambda x: x.distance_km)
     return results
+
 
 @app.get("/games/{game_id}", response_model=GamePublicResponse, tags=["Catálogo"])
 def get_game_by_id(game_id: int):
@@ -156,17 +282,43 @@ def get_game_by_id(game_id: int):
         )
     return GamePublicResponse(**GAMES_DB[game_id].model_dump())
 
+
 @app.patch("/games/{game_id}/status", response_model=GamePublicResponse, tags=["Catálogo"])
-def update_game_status(game_id: int, payload: StatusUpdatePayload):
-    """Atualiza o status do jogo (utilizado na confirmação ou devolução de locação)."""
-    logger.info(f"Atualização de status do jogo ID={game_id} para {payload.status}")
+def update_game_status(
+    game_id: int,
+    payload: StatusUpdatePayload,
+    response: Response,
+    x_lamport_clock: Optional[int] = Header(default=None)
+):
+    """
+    FA-05: Atualiza o status do jogo (alternância entre AVAILABLE e MAINTENANCE pelo locador,
+    bloqueando com 409 Conflict caso o jogo esteja atualmente RENTED).
+    """
+    clock = tick_lamport(x_lamport_clock)
+    response.headers["X-Lamport-Clock"] = str(clock)
+    logger.info(f"[LAMPORT={clock}] Atualização de status do jogo ID={game_id} para {payload.status}")
+
     if game_id not in GAMES_DB:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Jogo com ID {game_id} não encontrado no catálogo."
         )
-    GAMES_DB[game_id].status = payload.status
-    return GamePublicResponse(**GAMES_DB[game_id].model_dump())
+
+    game = GAMES_DB[game_id]
+    if game.status == GameStatus.RENTED:
+        logger.warning(f"[LAMPORT={clock}] Conflito 409: tentativa de alterar jogo ID={game_id} que está RENTED para {payload.status}")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Não é possível alterar o status do jogo '{game.title}' pois ele está atualmente alugado (RENTED)."
+        )
+
+    game.status = payload.status
+    game.version += 1
+    game.lamport_clock = clock
+    game.updated_at = datetime.now(timezone.utc).isoformat()
+    _save_game(game)
+    return GamePublicResponse(**game.model_dump())
+
 
 if __name__ == "__main__":
     import uvicorn
