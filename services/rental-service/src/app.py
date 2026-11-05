@@ -4,7 +4,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
-from fastapi import FastAPI, Header, HTTPException, Response, status
+from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import RentalCreateRequest, RentalResponse, RentalStatus
@@ -116,6 +116,58 @@ def _save_rental(record: dict) -> RentalResponse:
     return RentalResponse(**record)
 
 
+def _find_rentals(
+    renter_email: Optional[str] = None,
+    game_id: Optional[int] = None,
+    status_filter: Optional[RentalStatus] = None
+) -> List[dict]:
+    """Consulta locações no DynamoDB ou na memória local com suporte a múltiplos predicados de filtro."""
+    table = _get_ddb_table()
+    if table is not None:
+        try:
+            from boto3.dynamodb.conditions import Attr
+            filter_exp = None
+            if renter_email:
+                filter_exp = Attr("renter_email").eq(renter_email)
+            if game_id is not None:
+                cond = Attr("game_id").eq(game_id)
+                filter_exp = filter_exp & cond if filter_exp else cond
+            if status_filter:
+                st_val = status_filter.value if isinstance(status_filter, RentalStatus) else str(status_filter)
+                cond = Attr("status").eq(st_val)
+                filter_exp = filter_exp & cond if filter_exp else cond
+
+            scan_kwargs = {}
+            if filter_exp:
+                scan_kwargs["FilterExpression"] = filter_exp
+            resp = table.scan(**scan_kwargs)
+            items = resp.get("Items", [])
+            for item in items:
+                if "daily_rate" in item:
+                    item["daily_rate"] = float(item["daily_rate"])
+                if "total_price" in item:
+                    item["total_price"] = float(item["total_price"])
+                if "game_id" in item:
+                    item["game_id"] = int(item["game_id"])
+                if "rental_days" in item:
+                    item["rental_days"] = int(item["rental_days"])
+                if "lamport_clock" in item:
+                    item["lamport_clock"] = int(item["lamport_clock"])
+                RENTALS_DB[item["rental_id"]] = item
+            return items
+        except Exception as exc:
+            logger.warning(f"Falha ao consultar DynamoDB, utilizando base em memória: {exc}")
+
+    # Fallback em memória local
+    status_val = status_filter.value if isinstance(status_filter, RentalStatus) else (str(status_filter) if status_filter else None)
+    return [
+        r for r in RENTALS_DB.values()
+        if (not renter_email or r.get("renter_email") == renter_email)
+        and (game_id is None or r.get("game_id") == game_id)
+        and (not status_val or (r.get("status").value if isinstance(r.get("status"), RentalStatus) else r.get("status")) == status_val)
+    ]
+
+
 @app.get("/health", tags=["Monitoramento"])
 def health_check():
     """Health check do rental-service."""
@@ -205,14 +257,44 @@ async def create_rental(
 
 
 @app.get("/rentals", response_model=List[RentalResponse], tags=["Locações"])
-def list_rentals():
-    """Lista todas as reservas registradas."""
-    return [RentalResponse(**r) for r in RENTALS_DB.values()]
+def list_rentals(
+    response: Response,
+    renter_email: Optional[str] = Query(None, description="FB-02: Filtra locações pelo e-mail do locatário (Painel 'Meus Aluguéis')"),
+    game_id: Optional[int] = Query(None, description="FB-02: Filtra histórico de locações pelo ID do jogo (Visão do Locador)"),
+    status: Optional[RentalStatus] = Query(None, description="Filtra por status da locação (CONFIRMED, COMPLETED, CANCELLED)"),
+    x_lamport_clock: Optional[int] = Header(default=None)
+):
+    """
+    FB-02: Consulta reservas registradas com suporte a filtros combináveis por locatário, jogo e status.
+    Atende ao painel 'Meus Aluguéis' (Locatário) e ao histórico de locações (Locador).
+    """
+    clock = tick_lamport(x_lamport_clock)
+    response.headers["X-Lamport-Clock"] = str(clock)
+    logger.info(f"[LAMPORT={clock}] Consulta de locações: renter_email={renter_email}, game_id={game_id}, status={status}")
+
+    records = _find_rentals(renter_email=renter_email, game_id=game_id, status_filter=status)
+    return [RentalResponse(**r) for r in records]
 
 
 @app.get("/rentals/{rental_id}", response_model=RentalResponse, tags=["Locações"])
 def get_rental(rental_id: str):
     """Consulta detalhes de uma locação específica."""
+    if rental_id not in RENTALS_DB:
+        table = _get_ddb_table()
+        if table is not None:
+            try:
+                item = table.get_item(Key={"rental_id": rental_id}).get("Item")
+                if item:
+                    for k in ("daily_rate", "total_price"):
+                        if k in item and item[k] is not None:
+                            item[k] = float(item[k])
+                    for k in ("game_id", "rental_days", "lamport_clock"):
+                        if k in item and item[k] is not None:
+                            item[k] = int(item[k])
+                    RENTALS_DB[rental_id] = item
+            except Exception as exc:
+                logger.warning(f"Falha ao buscar locação {rental_id} no DynamoDB: {exc}")
+
     if rental_id not in RENTALS_DB:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -229,15 +311,35 @@ async def return_rental(
 ):
     """
     FB-01 / FB-03: Finaliza a locação e comunica o catalog-service via /release para liberar o exemplar.
+    Idempotente: se já estiver COMPLETED, retorna o estado final sem duplicar chamadas de liberação.
     """
     clock = tick_lamport(x_lamport_clock)
+
+    if rental_id not in RENTALS_DB:
+        table = _get_ddb_table()
+        if table is not None:
+            try:
+                item = table.get_item(Key={"rental_id": rental_id}).get("Item")
+                if item:
+                    for k in ("daily_rate", "total_price"):
+                        if k in item and item[k] is not None:
+                            item[k] = float(item[k])
+                    for k in ("game_id", "rental_days", "lamport_clock"):
+                        if k in item and item[k] is not None:
+                            item[k] = int(item[k])
+                    RENTALS_DB[rental_id] = item
+            except Exception as exc:
+                logger.warning(f"Falha ao recuperar locação {rental_id} no DynamoDB: {exc}")
+
     if rental_id not in RENTALS_DB:
         response.headers["X-Lamport-Clock"] = str(clock)
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Locação não encontrada.")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Locação com ID {rental_id} não encontrada.")
 
     rental = RENTALS_DB[rental_id]
-    if rental["status"] == RentalStatus.COMPLETED:
+    current_status = rental.get("status")
+    if current_status == RentalStatus.COMPLETED or current_status == "COMPLETED":
         response.headers["X-Lamport-Clock"] = str(clock)
+        logger.info(f"[LAMPORT={clock}] Locação {rental_id} já finalizada anteriormente (retorno idempotente).")
         return RentalResponse(**rental)
 
     # Libera jogo atomicamente no catálogo remoto
@@ -262,7 +364,7 @@ async def return_rental(
     response.headers["X-Lamport-Clock"] = str(clock)
 
     resp_obj = _save_rental(rental)
-    logger.info(f"[LAMPORT={clock}] Locação {rental_id} finalizada. Jogo {rental['game_id']} liberado no catálogo.")
+    logger.info(f"[LAMPORT={clock}] Locação {rental_id} finalizada com sucesso. Jogo {rental['game_id']} liberado no catálogo.")
     return resp_obj
 
 
