@@ -12,6 +12,8 @@ from models import (
     GameCreateRequest,
     GameNearbyResponse,
     GamePublicResponse,
+    GameReleaseRequest,
+    GameReserveRequest,
     GameStatus,
     StatusUpdatePayload,
 )
@@ -159,8 +161,36 @@ def _get_ddb_table():
 def _put_ddb_game(table, game: Game) -> None:
     item = {**game.model_dump(), "status": game.status.value}
     for k in ("price_per_day", "latitude", "longitude"):
-        item[k] = Decimal(str(item[k]))
-    table.put_item(Item=item)
+        if k in item and item[k] is not None:
+            item[k] = Decimal(str(item[k]))
+    clean_item = {k: v for k, v in item.items() if v is not None}
+    table.put_item(Item=clean_item)
+
+
+def _reserve_ddb_game(table, game_id: int, rental_id: str, renter_name: str, clock: int) -> bool:
+    """Trava atômica condicional no DynamoDB: só atualiza se status atual for AVAILABLE."""
+    try:
+        table.update_item(
+            Key={"id": game_id},
+            UpdateExpression="SET #st = :rented, current_rental_id = :rid, current_renter_name = :rname, version = version + :inc, lamport_clock = :clk, updated_at = :upd",
+            ConditionExpression="attribute_exists(id) AND #st = :avail",
+            ExpressionAttributeNames={"#st": "status"},
+            ExpressionAttributeValues={
+                ":rented": GameStatus.RENTED.value,
+                ":avail": GameStatus.AVAILABLE.value,
+                ":rid": rental_id,
+                ":rname": renter_name,
+                ":inc": 1,
+                ":clk": clock,
+                ":upd": datetime.now(timezone.utc).isoformat()
+            }
+        )
+        return True
+    except Exception as exc:
+        if "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc):
+            raise
+        logger.warning(f"Erro na reserva condicional do DynamoDB para jogo {game_id}: {exc}")
+        return False
 
 
 def _save_game(game: Game) -> GamePublicResponse:
@@ -281,6 +311,96 @@ def update_game_status(
         game.version += 1
         game.lamport_clock = clock
         game.updated_at = datetime.now(timezone.utc).isoformat()
+    return _save_game(game)
+
+
+@app.post("/games/{game_id}/reserve", response_model=GamePublicResponse, tags=["Catálogo"])
+def reserve_game(
+    game_id: int,
+    payload: GameReserveRequest,
+    response: Response,
+    x_lamport_clock: Optional[int] = Header(default=None)
+):
+    """
+    FA-03 / FA-04: Reserva atômica de exemplar para locação.
+    Garante exclusão mútua: se o jogo não estiver AVAILABLE, rejeita imediatamente com 409 Conflict.
+    """
+    clock = tick_lamport(x_lamport_clock)
+    response.headers["X-Lamport-Clock"] = str(clock)
+    logger.info(f"[LAMPORT={clock}] Tentativa de reserva atômica para o jogo ID={game_id} (Rental={payload.rental_id}, Locatário={payload.renter_name})")
+
+    with _lock:
+        if game_id not in GAMES_DB:
+            logger.warning(f"Jogo ID={game_id} não encontrado para reserva.")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Jogo com ID {game_id} não encontrado no catálogo."
+            )
+
+        game = GAMES_DB[game_id]
+        if game.status != GameStatus.AVAILABLE:
+            logger.warning(f"[LAMPORT={clock}] Conflito 409: Jogo ID={game_id} indisponível para reserva (status atual: {game.status})")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"O jogo '{game.title}' não está disponível para reserva no momento (status atual: {game.status})."
+            )
+
+        # Atualiza trava condicional no DynamoDB se configurado
+        table = _get_ddb_table()
+        if table is not None:
+            try:
+                _reserve_ddb_game(table, game_id, payload.rental_id, payload.renter_name, clock)
+            except Exception as exc:
+                if "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc):
+                    logger.warning(f"[LAMPORT={clock}] DynamoDB ConditionalCheckFailedException para jogo ID={game_id}")
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Conflito de concorrência: o jogo '{game.title}' acabou de ser reservado por outro locatário."
+                    )
+
+        game.status = GameStatus.RENTED
+        game.current_rental_id = payload.rental_id
+        game.current_renter_name = payload.renter_name
+        game.version += 1
+        game.lamport_clock = clock
+        game.updated_at = datetime.now(timezone.utc).isoformat()
+
+    logger.info(f"[LAMPORT={clock}] Jogo ID={game_id} reservado com sucesso para rental {payload.rental_id}.")
+    return _save_game(game)
+
+
+@app.post("/games/{game_id}/release", response_model=GamePublicResponse, tags=["Catálogo"])
+def release_game(
+    game_id: int,
+    response: Response,
+    payload: Optional[GameReleaseRequest] = None,
+    x_lamport_clock: Optional[int] = Header(default=None)
+):
+    """
+    FB-01: Liberação atômica de exemplar alugado.
+    Restaura status para AVAILABLE e limpa vínculos de locação ativa.
+    """
+    clock = tick_lamport(x_lamport_clock)
+    response.headers["X-Lamport-Clock"] = str(clock)
+    logger.info(f"[LAMPORT={clock}] Liberação de exemplar solicitada para o jogo ID={game_id}")
+
+    with _lock:
+        if game_id not in GAMES_DB:
+            logger.warning(f"Jogo ID={game_id} não encontrado para liberação.")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Jogo com ID {game_id} não encontrado no catálogo."
+            )
+
+        game = GAMES_DB[game_id]
+        game.status = GameStatus.AVAILABLE
+        game.current_rental_id = None
+        game.current_renter_name = None
+        game.version += 1
+        game.lamport_clock = clock
+        game.updated_at = datetime.now(timezone.utc).isoformat()
+
+    logger.info(f"[LAMPORT={clock}] Jogo ID={game_id} liberado com sucesso para AVAILABLE.")
     return _save_game(game)
 
 

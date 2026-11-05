@@ -13,6 +13,12 @@ class GameNotFoundError(Exception):
     """Erro quando o jogo não existe no catálogo remoto."""
     pass
 
+class GameConflictError(Exception):
+    """Erro quando o jogo está indisponível ou já reservado (HTTP 409 Conflict)."""
+    def __init__(self, message: str, status_code: int = 409):
+        super().__init__(message)
+        self.status_code = status_code
+
 class CatalogClient:
     """
     Cliente REST/RPC responsável pela comunicação síncrona
@@ -68,3 +74,92 @@ class CatalogClient:
         except httpx.RequestError as exc:
             logger.error(f"Falha de rede na atualização de status em {url}: {exc}")
             raise CatalogCommunicationError(f"Erro de comunicação ao atualizar catálogo: {exc}")
+
+    async def reserve_game(
+        self,
+        game_id: int,
+        rental_id: str,
+        renter_name: str,
+        renter_email: Optional[str] = None,
+        lamport_clock: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        FA-03 / FA-04: Reserva atômica de exemplar via chamada RPC síncrona.
+        Envia X-Lamport-Clock e trata exclusão mútua distribuída (409 Conflict).
+        """
+        url = f"{self.base_url}/games/{game_id}/reserve"
+        headers = {"Content-Type": "application/json"}
+        if lamport_clock is not None:
+            headers["X-Lamport-Clock"] = str(lamport_clock)
+
+        payload = {
+            "rental_id": rental_id,
+            "renter_name": renter_name,
+            "renter_email": renter_email
+        }
+        logger.info(f"Disparando reserva atômica S2S: POST {url} (Rental={rental_id}, Clock={lamport_clock})")
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(url, json=payload, headers=headers)
+
+            if response.status_code == 200:
+                data = response.json()
+                resp_clock = response.headers.get("X-Lamport-Clock")
+                if resp_clock and "lamport_clock" not in data:
+                    data["lamport_clock"] = int(resp_clock)
+                logger.info(f"Reserva do jogo {game_id} confirmada pelo catálogo remoto.")
+                return data
+            elif response.status_code == 409:
+                err_detail = response.json().get("detail", "Jogo indisponível ou já reservado.")
+                logger.warning(f"Conflito 409 reportado pelo catálogo para jogo {game_id}: {err_detail}")
+                raise GameConflictError(err_detail)
+            elif response.status_code == 404:
+                err_detail = response.json().get("detail", f"Jogo com ID {game_id} não encontrado.")
+                logger.warning(f"Jogo {game_id} não encontrado no catálogo: 404 Not Found")
+                raise GameNotFoundError(err_detail)
+            else:
+                logger.error(f"Catalog-service retornou status inesperado {response.status_code}: {response.text}")
+                raise CatalogCommunicationError(f"Erro inesperado no catálogo: status {response.status_code}")
+
+        except (GameConflictError, GameNotFoundError):
+            raise
+        except httpx.RequestError as exc:
+            logger.error(f"Falha de rede na reserva atômica em {url}: {exc}")
+            raise CatalogCommunicationError(f"Não foi possível contatar o catalog-service ({exc})")
+
+    async def release_game(
+        self,
+        game_id: int,
+        rental_id: Optional[str] = None,
+        lamport_clock: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        FB-01: Liberação atômica de exemplar via chamada RPC síncrona.
+        """
+        url = f"{self.base_url}/games/{game_id}/release"
+        headers = {"Content-Type": "application/json"}
+        if lamport_clock is not None:
+            headers["X-Lamport-Clock"] = str(lamport_clock)
+
+        payload = {"rental_id": rental_id} if rental_id else None
+        logger.info(f"Disparando liberação atômica S2S: POST {url} (Game={game_id})")
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(url, json=payload, headers=headers)
+
+            if response.status_code == 200:
+                logger.info(f"Liberação do jogo {game_id} confirmada pelo catálogo remoto.")
+                return response.json()
+            elif response.status_code == 404:
+                raise GameNotFoundError(f"Jogo {game_id} não encontrado no catálogo para liberação.")
+            else:
+                raise CatalogCommunicationError(f"Erro ao liberar jogo no catálogo: {response.status_code}")
+
+        except GameNotFoundError:
+            raise
+        except httpx.RequestError as exc:
+            logger.error(f"Falha de rede na liberação em {url}: {exc}")
+            raise CatalogCommunicationError(f"Não foi possível contatar o catalog-service ({exc})")
+

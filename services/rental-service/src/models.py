@@ -16,7 +16,9 @@ class RentalCreateRequest(BaseModel):
 
 class RentalResponse(BaseModel):
     rental_id: str
+    urn: str = ""
     game_id: int
+    game_urn: str = ""
     game_title: str
     renter_name: str
     renter_email: str
@@ -24,4 +26,13 @@ class RentalResponse(BaseModel):
     daily_rate: float
     total_price: float
     status: RentalStatus
+    lamport_clock: int = 1
     created_at: str
+    returned_at: Optional[str] = None
+
+    def model_post_init(self, __context) -> None:
+        if not self.urn and self.rental_id:
+            self.urn = f"urn:gamerent:rental:{self.rental_id}"
+        if not self.game_urn and self.game_id:
+            self.game_urn = f"urn:gamerent:game:sa-east-1:{self.game_id}"
+
