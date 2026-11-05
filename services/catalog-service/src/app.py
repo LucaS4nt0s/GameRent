@@ -180,13 +180,12 @@ def _save_game(game: Game) -> GamePublicResponse:
 
 
 def _read_games(consistency: ConsistencyMode) -> tuple[list[Game], float]:
-    t0 = time.perf_counter()
     table = _get_ddb_table()
+    t0 = time.perf_counter()
     if table is not None:
         try:
             items = table.scan(ConsistentRead=(consistency == "strong")).get("Items", [])
-            games = [Game(**it) for it in items]
-            games.sort(key=lambda g: g.id)
+            games = sorted((Game(**it) for it in items), key=lambda g: g.id)
             return games, round((time.perf_counter() - t0) * 1000, 3)
         except Exception as exc:
             logger.warning(f"Falha ao ler catálogo no DynamoDB: {exc}")
@@ -194,8 +193,8 @@ def _read_games(consistency: ConsistencyMode) -> tuple[list[Game], float]:
 
 
 def _read_game(game_id: int, consistency: ConsistencyMode) -> tuple[Optional[Game], float]:
-    t0 = time.perf_counter()
     table = _get_ddb_table()
+    t0 = time.perf_counter()
     if table is not None:
         try:
             item = table.get_item(Key={"id": game_id}, ConsistentRead=(consistency == "strong")).get("Item")
@@ -270,9 +269,9 @@ def list_games(
 @app.get("/games/nearby", response_model=List[GameNearbyResponse], tags=["Catálogo"])
 def list_nearby_games(
     response: Response,
-    lat: float = Query(..., description="Latitude do locatário"),
-    lon: float = Query(..., description="Longitude do locatário"),
-    max_km: float = Query(10.0, description="Raio máximo de busca em km"),
+    lat: float = Query(..., ge=-90.0, le=90.0, description="Latitude do locatário"),
+    lon: float = Query(..., ge=-180.0, le=180.0, description="Longitude do locatário"),
+    max_km: float = Query(10.0, gt=0, description="Raio máximo de busca em km"),
     status_filter: Optional[GameStatus] = None,
     category: Optional[str] = None,
     owner_id: Optional[str] = None,
