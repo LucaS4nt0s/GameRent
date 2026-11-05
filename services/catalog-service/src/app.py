@@ -1,6 +1,8 @@
 import logging
 import os
+import socket
 import threading
+import urllib.parse
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional
@@ -8,6 +10,9 @@ from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import (
+    DiscoveryResponse,
+    DNSResolutionInfo,
+    DynamoDBStatusInfo,
     Game,
     GameCreateRequest,
     GameNearbyResponse,
@@ -44,12 +49,60 @@ app.add_middleware(
 _lock = threading.Lock()
 _lamport_clock = 0
 
+INSTANCE_ID = os.getenv("INSTANCE_ID", os.getenv("HOSTNAME", "node-catalog-01"))
+NODE_URN = f"urn:gamerent:node:catalog-service:{INSTANCE_ID}"
+DNS_TARGET = os.getenv("DNS_DISCOVERY_TARGET", "catalog.gamerent.internal")
+
 
 def tick_lamport(incoming: Optional[int] = None) -> int:
     global _lamport_clock
     with _lock:
         _lamport_clock = (max(_lamport_clock, incoming) if incoming is not None else _lamport_clock) + 1
         return _lamport_clock
+
+
+def _resolve_dns(target: str) -> DNSResolutionInfo:
+    try:
+        host = target
+        if "://" in host:
+            host = urllib.parse.urlparse(host).hostname or host
+        if ":" in host:
+            host = host.split(":")[0]
+
+        addr_info = socket.getaddrinfo(host, None)
+        ips = list(dict.fromkeys([item[4][0] for item in addr_info]))
+        return DNSResolutionInfo(
+            target_hostname=host,
+            resolved_ips=ips,
+            status="RESOLVED"
+        )
+    except Exception as exc:
+        return DNSResolutionInfo(
+            target_hostname=target,
+            resolved_ips=[],
+            status="UNRESOLVED",
+            error_message=str(exc)
+        )
+
+
+def _get_dynamodb_status() -> DynamoDBStatusInfo:
+    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL")
+    name = os.getenv("GAMES_TABLE_NAME", "gamerent_games")
+    table = _get_ddb_table()
+    if table is not None:
+        mode = "LOCAL_DYNAMODB" if endpoint and ("localhost" in endpoint or "127.0.0.1" in endpoint) else "AWS_DYNAMODB"
+        return DynamoDBStatusInfo(
+            connected=True,
+            table_name=name,
+            mode=mode,
+            endpoint_url=endpoint
+        )
+    return DynamoDBStatusInfo(
+        connected=False,
+        table_name=name,
+        mode="IN_MEMORY_FALLBACK",
+        endpoint_url=endpoint
+    )
 
 
 # Base de dados em memória inicial (Jogos de Tabuleiro)
@@ -205,14 +258,56 @@ def _save_game(game: Game) -> GamePublicResponse:
 
 
 @app.get("/health", tags=["Monitoramento"])
-def health_check():
+def health_check(
+    response: Response = None,
+    x_lamport_clock: Optional[int] = Header(default=None)
+):
     """Endpoint de integridade para monitoramento (Health Check)."""
+    clock = tick_lamport(x_lamport_clock)
+    if response:
+        response.headers["X-Lamport-Clock"] = str(clock)
     return {
         "status": "HEALTHY",
         "service": "catalog-service",
+        "node_urn": NODE_URN,
+        "instance_id": INSTANCE_ID,
         "total_games": len(GAMES_DB),
-        "lamport_clock": _lamport_clock
+        "lamport_clock": clock
     }
+
+
+@app.get("/discovery", response_model=DiscoveryResponse, tags=["Observabilidade"])
+def get_discovery(
+    response: Response,
+    x_lamport_clock: Optional[int] = Header(default=None)
+):
+    """
+    FC-01: Descoberta de serviços, identidade de nó (URNs), resolução DNS e telemetria.
+    """
+    clock = tick_lamport(x_lamport_clock)
+    response.headers["X-Lamport-Clock"] = str(clock)
+
+    hostname = socket.gethostname()
+    try:
+        local_ip = socket.gethostbyname(hostname)
+    except Exception:
+        local_ip = "127.0.0.1"
+
+    dns_info = _resolve_dns(DNS_TARGET)
+    ddb_info = _get_dynamodb_status()
+
+    return DiscoveryResponse(
+        service="catalog-service",
+        node_urn=NODE_URN,
+        instance_id=INSTANCE_ID,
+        hostname=hostname,
+        local_ip=local_ip,
+        dns_target=DNS_TARGET,
+        dns_resolution=dns_info,
+        lamport_clock=clock,
+        dynamodb=ddb_info,
+        timestamp=datetime.now(timezone.utc).isoformat()
+    )
 
 
 @app.post("/games", response_model=GamePublicResponse, status_code=status.HTTP_201_CREATED, tags=["Catálogo"])
