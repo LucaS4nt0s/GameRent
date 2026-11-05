@@ -1,6 +1,5 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
 from pydantic import BaseModel, Field
 
 
@@ -21,7 +20,7 @@ class GameCreateRequest(BaseModel):
     longitude: float = Field(..., ge=-180.0, le=180.0)
 
 
-class Game(BaseModel):
+class GamePublicResponse(BaseModel):
     id: int
     urn: str = ""
     title: str
@@ -32,8 +31,6 @@ class Game(BaseModel):
     owner_id: str
     owner_urn: str = ""
     owner_name: str
-    latitude: float
-    longitude: float
     version: int = 1
     lamport_clock: int = 1
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -45,20 +42,9 @@ class Game(BaseModel):
             self.owner_urn = f"urn:gamerent:owner:{self.owner_id}"
 
 
-class GamePublicResponse(BaseModel):
-    id: int
-    urn: str
-    title: str
-    description: str
-    category: str
-    price_per_day: float
-    status: GameStatus
-    owner_id: str
-    owner_urn: str
-    owner_name: str
-    version: int = 1
-    lamport_clock: int = 1
-    updated_at: Optional[str] = None
+class Game(GamePublicResponse):
+    latitude: float
+    longitude: float
 
 
 class GameNearbyResponse(GamePublicResponse):

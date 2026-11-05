@@ -40,9 +40,12 @@ if __name__ == "__main__":
     _, nearby = req("GET", "/games/nearby?lat=-23.5505&lon=-46.6333&max_km=5")
     assert any(g["id"] == created["id"] for g in nearby)
 
-    # 3. Alternar status AVAILABLE <-> MAINTENANCE e bloquear RENTED (ID 4) com 409 Conflict
+    # 3. Alternar status AVAILABLE <-> MAINTENANCE, bloquear RENTED -> MAINTENANCE (409) e permitir devolução RENTED -> AVAILABLE (200)
     s_maint, g_maint = req("PATCH", f"/games/{created['id']}/status", {"status": "MAINTENANCE"})
     assert s_maint == 200 and g_maint["status"] == "MAINTENANCE"
     s_conflict, _ = req("PATCH", "/games/4/status", {"status": "MAINTENANCE"})
-    assert s_conflict == 409, f"Esperado 409 para jogo RENTED, obtido {s_conflict}"
+    assert s_conflict == 409, f"Esperado 409 para jogo RENTED -> MAINTENANCE, obtido {s_conflict}"
+    s_return, g_return = req("PATCH", "/games/4/status", {"status": "AVAILABLE"})
+    assert s_return == 200 and g_return["status"] == "AVAILABLE", f"Devolução RENTED -> AVAILABLE falhou: {s_return}"
+    req("PATCH", "/games/4/status", {"status": "RENTED"})
     print("OK: Todos os critérios de aceite da Issue #12 validados!")

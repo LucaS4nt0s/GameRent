@@ -38,17 +38,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_clock_lock = threading.Lock()
+# ponytail: lock em memória por processo; migrar para DynamoDB ConditionalExpression em multi-réplica
+_lock = threading.Lock()
 _lamport_clock = 0
 
 
 def tick_lamport(incoming: Optional[int] = None) -> int:
     global _lamport_clock
-    with _clock_lock:
-        if incoming is not None:
-            _lamport_clock = max(_lamport_clock, incoming) + 1
-        else:
-            _lamport_clock += 1
+    with _lock:
+        _lamport_clock = (max(_lamport_clock, incoming) if incoming is not None else _lamport_clock) + 1
         return _lamport_clock
 
 
@@ -116,42 +114,39 @@ GAMES_DB: dict[int, Game] = {
     )
 }
 
+# ponytail: espelhamento write-through opcional; leituras seguem em GAMES_DB até a issue de repositório
 _ddb_table = None
 
 
 def _get_ddb_table():
-    """Conecta à tabela gamerent_games no DynamoDB se configurado/disponível."""
     global _ddb_table
     if _ddb_table is not None:
         return _ddb_table
     endpoint = os.getenv("DYNAMODB_ENDPOINT_URL")
-    use_ddb = os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") or bool(endpoint)
-    if not use_ddb:
+    if not (os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") or endpoint):
         return None
     try:
         import boto3
-        region = os.getenv("AWS_REGION", "sa-east-1")
         ddb = boto3.resource(
             "dynamodb",
-            region_name=region,
+            region_name=os.getenv("AWS_REGION", "sa-east-1"),
             endpoint_url=endpoint,
             aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "test"),
             aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
         )
-        table_name = os.getenv("GAMES_TABLE_NAME", "gamerent_games")
-        existing = [t.name for t in ddb.tables.all()]
-        if table_name not in existing:
-            table = ddb.create_table(
-                TableName=table_name,
+        name = os.getenv("GAMES_TABLE_NAME", "gamerent_games")
+        table = (
+            ddb.Table(name)
+            if name in [t.name for t in ddb.tables.all()]
+            else ddb.create_table(
+                TableName=name,
                 KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
                 AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "N"}],
                 BillingMode="PAY_PER_REQUEST",
             )
-            table.wait_until_exists()
-        else:
-            table = ddb.Table(table_name)
-
-        if table.item_count == 0 and not table.scan(Limit=1).get("Items"):
+        )
+        table.wait_until_exists()
+        if not table.scan(Limit=1).get("Items"):
             for g in GAMES_DB.values():
                 _put_ddb_game(table, g)
         _ddb_table = table
@@ -162,11 +157,10 @@ def _get_ddb_table():
 
 
 def _put_ddb_game(table, game: Game) -> None:
-    data = game.model_dump()
-    data["status"] = game.status.value
+    item = {**game.model_dump(), "status": game.status.value}
     for k in ("price_per_day", "latitude", "longitude"):
-        data[k] = Decimal(str(data[k]))
-    table.put_item(Item=data)
+        item[k] = Decimal(str(item[k]))
+    table.put_item(Item=item)
 
 
 def _save_game(game: Game) -> Game:
@@ -197,47 +191,25 @@ def create_game(
     response: Response,
     x_lamport_clock: Optional[int] = Header(default=None)
 ):
-    """
-    FA-01: Cadastra um novo jogo de tabuleiro pelo locador.
-    Salva latitude/longitude de forma privada sem expô-las no payload público,
-    gera URNs padronizados e incrementa o Relógio Lógico de Lamport.
-    """
+    """FA-01: Cadastra um novo jogo de tabuleiro pelo locador sem expor coordenadas de GPS."""
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
-
-    new_id = max(GAMES_DB.keys(), default=0) + 1
-    new_game = Game(
-        id=new_id,
-        urn=f"urn:gamerent:game:sa-east-1:{new_id}",
-        title=payload.title,
-        description=payload.description,
-        category=payload.category,
-        price_per_day=payload.price_per_day,
-        status=GameStatus.AVAILABLE,
-        owner_id=payload.owner_id,
-        owner_urn=f"urn:gamerent:owner:{payload.owner_id}",
-        owner_name=payload.owner_name,
-        latitude=payload.latitude,
-        longitude=payload.longitude,
-        version=1,
-        lamport_clock=clock,
-        updated_at=datetime.now(timezone.utc).isoformat()
-    )
-    _save_game(new_game)
+    with _lock:
+        new_id = max(GAMES_DB.keys(), default=0) + 1
+        new_game = _save_game(Game(id=new_id, lamport_clock=clock, **payload.model_dump()))
     logger.info(f"[LAMPORT={clock}] Novo jogo cadastrado: ID={new_id}, URN={new_game.urn}")
-    return GamePublicResponse(**new_game.model_dump())
+    return new_game
 
 
 @app.get("/games", response_model=List[GamePublicResponse], tags=["Catálogo"])
 def list_games(status_filter: Optional[GameStatus] = None, owner_id: Optional[str] = None):
     """Lista todos os jogos, omitindo coordenadas sensíveis de GPS."""
     logger.info("Listagem de jogos solicitada.")
-    games = list(GAMES_DB.values())
-    if status_filter:
-        games = [g for g in games if g.status == status_filter]
-    if owner_id:
-        games = [g for g in games if g.owner_id == owner_id]
-    return [GamePublicResponse(**g.model_dump()) for g in games]
+    return [
+        g for g in GAMES_DB.values()
+        if (not status_filter or g.status == status_filter)
+        and (not owner_id or g.owner_id == owner_id)
+    ]
 
 
 @app.get("/games/nearby", response_model=List[GameNearbyResponse], tags=["Catálogo"])
@@ -246,33 +218,20 @@ def list_nearby_games(
     lon: float = Query(..., description="Longitude do locatário"),
     max_km: float = Query(10.0, description="Raio máximo de busca em km")
 ):
-    """
-    Calcula em memória a distância euclidiana/haversine entre o locatário e os jogos,
-    sem jamais expor as coordenadas reais do locador ao cliente (Requisito Arquitetural Entrega 1).
-    """
+    """Calcula a distância haversine sem expor as coordenadas reais do locador."""
     logger.info(f"Busca geográfica recebida: lat={lat}, lon={lon}, max_km={max_km}")
-    results = []
-
-    for game in GAMES_DB.values():
-        dist = calculate_haversine_distance(lat, lon, game.latitude, game.longitude)
-        if dist <= max_km:
-            results.append(
-                GameNearbyResponse(
-                    **game.model_dump(),
-                    distance_km=dist
-                )
-            )
-
+    results = [
+        GameNearbyResponse(**g.model_dump(), distance_km=dist)
+        for g in GAMES_DB.values()
+        if (dist := calculate_haversine_distance(lat, lon, g.latitude, g.longitude)) <= max_km
+    ]
     results.sort(key=lambda x: x.distance_km)
     return results
 
 
 @app.get("/games/{game_id}", response_model=GamePublicResponse, tags=["Catálogo"])
 def get_game_by_id(game_id: int):
-    """
-    Consulta um jogo específico.
-    Este endpoint é consumido internamente pelo RENTAL-SERVICE via chamada REST síncrona.
-    """
+    """Consulta um jogo específico."""
     logger.info(f"Consulta de jogo ID={game_id} solicitada.")
     if game_id not in GAMES_DB:
         logger.warning(f"Jogo ID={game_id} não encontrado.")
@@ -280,7 +239,7 @@ def get_game_by_id(game_id: int):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Jogo com ID {game_id} não encontrado no catálogo."
         )
-    return GamePublicResponse(**GAMES_DB[game_id].model_dump())
+    return GAMES_DB[game_id]
 
 
 @app.patch("/games/{game_id}/status", response_model=GamePublicResponse, tags=["Catálogo"])
@@ -291,33 +250,33 @@ def update_game_status(
     x_lamport_clock: Optional[int] = Header(default=None)
 ):
     """
-    FA-05: Atualiza o status do jogo (alternância entre AVAILABLE e MAINTENANCE pelo locador,
-    bloqueando com 409 Conflict caso o jogo esteja atualmente RENTED).
+    FA-05: Atualiza o status do jogo (bloqueia com 409 Conflict se estiver RENTED
+    e tentar ir para MAINTENANCE ou ser locado novamente, permitindo devolução para AVAILABLE).
     """
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
     logger.info(f"[LAMPORT={clock}] Atualização de status do jogo ID={game_id} para {payload.status}")
 
-    if game_id not in GAMES_DB:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Jogo com ID {game_id} não encontrado no catálogo."
-        )
+    with _lock:
+        if game_id not in GAMES_DB:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Jogo com ID {game_id} não encontrado no catálogo."
+            )
 
-    game = GAMES_DB[game_id]
-    if game.status == GameStatus.RENTED:
-        logger.warning(f"[LAMPORT={clock}] Conflito 409: tentativa de alterar jogo ID={game_id} que está RENTED para {payload.status}")
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Não é possível alterar o status do jogo '{game.title}' pois ele está atualmente alugado (RENTED)."
-        )
+        game = GAMES_DB[game_id]
+        if game.status == GameStatus.RENTED and payload.status != GameStatus.AVAILABLE:
+            logger.warning(f"[LAMPORT={clock}] Conflito 409: tentativa de alterar jogo ID={game_id} que está RENTED para {payload.status}")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Não é possível alterar o status do jogo '{game.title}' pois ele está atualmente alugado (RENTED)."
+            )
 
-    game.status = payload.status
-    game.version += 1
-    game.lamport_clock = clock
-    game.updated_at = datetime.now(timezone.utc).isoformat()
-    _save_game(game)
-    return GamePublicResponse(**game.model_dump())
+        game.status = payload.status
+        game.version += 1
+        game.lamport_clock = clock
+        game.updated_at = datetime.now(timezone.utc).isoformat()
+        return _save_game(game)
 
 
 if __name__ == "__main__":
