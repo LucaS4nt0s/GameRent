@@ -40,9 +40,11 @@ if __name__ == "__main__":
     _, nearby = req("GET", "/games/nearby?lat=-23.5505&lon=-46.6333&max_km=5")
     assert any(g["id"] == created["id"] for g in nearby)
 
-    # 3. Alternar status AVAILABLE <-> MAINTENANCE, bloquear RENTED -> MAINTENANCE (409) e permitir devolução RENTED -> AVAILABLE (200)
+    # 3. Alternar status AVAILABLE <-> MAINTENANCE, bloquear RENTED -> MAINTENANCE (409), MAINTENANCE -> RENTED (409) e permitir devolução RENTED -> AVAILABLE (200)
     s_maint, g_maint = req("PATCH", f"/games/{created['id']}/status", {"status": "MAINTENANCE"})
     assert s_maint == 200 and g_maint["status"] == "MAINTENANCE"
+    s_maint_rent, _ = req("PATCH", f"/games/{created['id']}/status", {"status": "RENTED"})
+    assert s_maint_rent == 409, f"Esperado 409 para jogo MAINTENANCE -> RENTED, obtido {s_maint_rent}"
     s_conflict, _ = req("PATCH", "/games/4/status", {"status": "MAINTENANCE"})
     assert s_conflict == 409, f"Esperado 409 para jogo RENTED -> MAINTENANCE, obtido {s_conflict}"
     s_return, g_return = req("PATCH", "/games/4/status", {"status": "AVAILABLE"})

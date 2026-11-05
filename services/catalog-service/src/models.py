@@ -20,7 +20,7 @@ class GameCreateRequest(BaseModel):
     longitude: float = Field(..., ge=-180.0, le=180.0)
 
 
-class GamePublicResponse(BaseModel):
+class _GameBase(BaseModel):
     id: int
     urn: str = ""
     title: str
@@ -42,7 +42,11 @@ class GamePublicResponse(BaseModel):
             self.owner_urn = f"urn:gamerent:owner:{self.owner_id}"
 
 
-class Game(GamePublicResponse):
+class GamePublicResponse(_GameBase):
+    pass
+
+
+class Game(_GameBase):
     latitude: float
     longitude: float
 

@@ -163,7 +163,7 @@ def _put_ddb_game(table, game: Game) -> None:
     table.put_item(Item=item)
 
 
-def _save_game(game: Game) -> Game:
+def _save_game(game: Game) -> GamePublicResponse:
     GAMES_DB[game.id] = game
     table = _get_ddb_table()
     if table is not None:
@@ -171,7 +171,7 @@ def _save_game(game: Game) -> Game:
             _put_ddb_game(table, game)
         except Exception as exc:
             logger.warning(f"Falha ao persistir jogo {game.id} no DynamoDB: {exc}")
-    return game
+    return GamePublicResponse(**game.model_dump())
 
 
 @app.get("/health", tags=["Monitoramento"])
@@ -196,9 +196,10 @@ def create_game(
     response.headers["X-Lamport-Clock"] = str(clock)
     with _lock:
         new_id = max(GAMES_DB.keys(), default=0) + 1
-        new_game = _save_game(Game(id=new_id, lamport_clock=clock, **payload.model_dump()))
-    logger.info(f"[LAMPORT={clock}] Novo jogo cadastrado: ID={new_id}, URN={new_game.urn}")
-    return new_game
+        game = Game(id=new_id, lamport_clock=clock, **payload.model_dump())
+        GAMES_DB[new_id] = game
+    logger.info(f"[LAMPORT={clock}] Novo jogo cadastrado: ID={new_id}, URN={game.urn}")
+    return _save_game(game)
 
 
 @app.get("/games", response_model=List[GamePublicResponse], tags=["Catálogo"])
@@ -206,7 +207,8 @@ def list_games(status_filter: Optional[GameStatus] = None, owner_id: Optional[st
     """Lista todos os jogos, omitindo coordenadas sensíveis de GPS."""
     logger.info("Listagem de jogos solicitada.")
     return [
-        g for g in GAMES_DB.values()
+        GamePublicResponse(**g.model_dump())
+        for g in GAMES_DB.values()
         if (not status_filter or g.status == status_filter)
         and (not owner_id or g.owner_id == owner_id)
     ]
@@ -239,7 +241,7 @@ def get_game_by_id(game_id: int):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Jogo com ID {game_id} não encontrado no catálogo."
         )
-    return GAMES_DB[game_id]
+    return GamePublicResponse(**GAMES_DB[game_id].model_dump())
 
 
 @app.patch("/games/{game_id}/status", response_model=GamePublicResponse, tags=["Catálogo"])
@@ -265,18 +267,21 @@ def update_game_status(
             )
 
         game = GAMES_DB[game_id]
-        if game.status == GameStatus.RENTED and payload.status != GameStatus.AVAILABLE:
-            logger.warning(f"[LAMPORT={clock}] Conflito 409: tentativa de alterar jogo ID={game_id} que está RENTED para {payload.status}")
+        if (
+            (game.status == GameStatus.RENTED and payload.status != GameStatus.AVAILABLE)
+            or (game.status == GameStatus.MAINTENANCE and payload.status == GameStatus.RENTED)
+        ):
+            logger.warning(f"[LAMPORT={clock}] Conflito 409: tentativa de alterar jogo ID={game_id} de {game.status} para {payload.status}")
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Não é possível alterar o status do jogo '{game.title}' pois ele está atualmente alugado (RENTED)."
+                detail=f"Transição inválida de '{game.status}' para '{payload.status}' no jogo '{game.title}'."
             )
 
         game.status = payload.status
         game.version += 1
         game.lamport_clock = clock
         game.updated_at = datetime.now(timezone.utc).isoformat()
-        return _save_game(game)
+    return _save_game(game)
 
 
 if __name__ == "__main__":
