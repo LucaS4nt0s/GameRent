@@ -1,6 +1,9 @@
 from datetime import datetime, timezone
 from enum import Enum
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
+
+ConsistencyMode = Literal["strong", "eventual"]
 
 
 class GameStatus(str, Enum):
@@ -31,6 +34,7 @@ class _GameBase(BaseModel):
     owner_id: str
     owner_urn: str = ""
     owner_name: str
+    current_rental_id: Optional[str] = None
     version: int = 1
     lamport_clock: int = 1
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -43,7 +47,9 @@ class _GameBase(BaseModel):
 
 
 class GamePublicResponse(_GameBase):
-    pass
+    consistency_mode: ConsistencyMode = "strong"
+    db_read_latency_ms: float = 0.0
+    served_by_node: str = ""
 
 
 class Game(_GameBase):
