@@ -1,7 +1,9 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import List, Optional
+from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
+
+ConsistencyMode = Literal["strong", "eventual"]
 
 
 class GameStatus(str, Enum):
@@ -57,7 +59,9 @@ class _GameBase(BaseModel):
 
 
 class GamePublicResponse(_GameBase):
-    pass
+    consistency_mode: ConsistencyMode = "strong"
+    db_read_latency_ms: float = 0.0
+    served_by_node: str = ""
 
 
 class Game(_GameBase):
@@ -98,4 +102,3 @@ class DiscoveryResponse(BaseModel):
     lamport_clock: int
     dynamodb: DynamoDBStatusInfo
     timestamp: str
-
