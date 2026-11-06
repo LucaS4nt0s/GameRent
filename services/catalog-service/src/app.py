@@ -127,29 +127,42 @@ def _get_ddb_table():
     global _ddb_table
     if _ddb_table is not None:
         return _ddb_table
-    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL")
+    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL") or None
     if not (os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") or endpoint):
         return None
     try:
         import boto3
+        # dynamodb-local aceita qualquer credencial; na AWS deixamos o boto3 usar a cadeia padrão
+        # (IAM Role da EC2), sem injetar chaves fictícias que sobrescreveriam o Instance Profile.
+        creds = (
+            {
+                "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "local"),
+                "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "local"),
+            }
+            if endpoint
+            else {}
+        )
         ddb = boto3.resource(
             "dynamodb",
             region_name=os.getenv("AWS_REGION", "sa-east-1"),
             endpoint_url=endpoint,
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "test"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
+            **creds,
         )
         name = os.getenv("GAMES_TABLE_NAME", "gamerent_games")
-        table = (
-            ddb.Table(name)
-            if name in [t.name for t in ddb.tables.all()]
-            else ddb.create_table(
-                TableName=name,
-                KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
-                AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "N"}],
-                BillingMode="PAY_PER_REQUEST",
+        try:
+            table = (
+                ddb.Table(name)
+                if name in [t.name for t in ddb.tables.all()]
+                else ddb.create_table(
+                    TableName=name,
+                    KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+                    AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "N"}],
+                    BillingMode="PAY_PER_REQUEST",
+                )
             )
-        )
+        except ddb.meta.client.exceptions.ResourceInUseException:
+            # Outra réplica do catalog-service criou a tabela ao mesmo tempo
+            table = ddb.Table(name)
         table.wait_until_exists()
         if not table.scan(Limit=1).get("Items"):
             for g in GAMES_DB.values():

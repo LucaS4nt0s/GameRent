@@ -1,13 +1,66 @@
+# Ambiente local da Entrega 3:
+#   - dynamodb-local: Amazon DynamoDB rodando em container (sem custo de nuvem)
+#   - catalog-service + catalog-service-2: duas réplicas do catálogo apontando para a MESMA tabela,
+#     demonstrando estado compartilhado e coordenação distribuída
+#   - rental-service e frontend
+#
+# Para rodar contra o DynamoDB real da AWS (EC2 com IAM Role), use o override:
+#   docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
+
+x-aws-env: &aws-env
+  AWS_REGION: ${AWS_REGION:-sa-east-1}
+  AWS_DEFAULT_REGION: ${AWS_REGION:-sa-east-1}
+  DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+  GAMES_TABLE_NAME: gamerent_games
+  RENTALS_TABLE_NAME: gamerent_rentals
+
 services:
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.5.2
+    container_name: gamerent-dynamodb
+    # -sharedDb: todas as réplicas enxergam o mesmo banco, independente de região/credencial
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      - "8000:8000"
+    networks:
+      - gamerent-net
+    restart: unless-stopped
+
+  # Réplica 1 do catálogo (porta 8001)
   catalog-service:
     build:
       context: ./services/catalog-service
       dockerfile: Dockerfile
-    container_name: gamerent-catalog
+    image: gamerent/catalog-service:local
+    container_name: gamerent-catalog-1
     ports:
       - "8001:8001"
+    environment:
+      <<: *aws-env
+      INSTANCE_ID: catalog-1
+    depends_on:
+      - dynamodb-local
     networks:
       - gamerent-net
+    restart: unless-stopped
+
+  # Réplica 2 do catálogo (porta 8003) — mesma imagem, mesmo banco, outro INSTANCE_ID.
+  # O alias "catalog-service" faz o Docker DNS devolver os IPs das duas réplicas (round-robin).
+  catalog-service-2:
+    image: gamerent/catalog-service:local
+    container_name: gamerent-catalog-2
+    ports:
+      - "8003:8001"
+    environment:
+      <<: *aws-env
+      INSTANCE_ID: catalog-2
+    depends_on:
+      - dynamodb-local
+      - catalog-service
+    networks:
+      gamerent-net:
+        aliases:
+          - catalog-service
     restart: unless-stopped
 
   rental-service:
@@ -18,9 +71,12 @@ services:
     ports:
       - "8002:8002"
     environment:
-      - CATALOG_SERVICE_URL=http://catalog-service:8001
+      <<: *aws-env
+      INSTANCE_ID: rental-1
+      CATALOG_SERVICE_URL: http://catalog-service:8001
     depends_on:
       - catalog-service
+      - catalog-service-2
     networks:
       - gamerent-net
     restart: unless-stopped

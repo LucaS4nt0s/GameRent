@@ -1,0 +1,38 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DynamoDBTabelasGameRent",
+      "Effect": "Allow",
+      "Action": "dynamodb:*",
+      "Resource": [
+        "arn:aws:dynamodb:sa-east-1:*:table/gamerent_*",
+        "arn:aws:dynamodb:sa-east-1:*:table/gamerent_*/index/*"
+      ]
+    },
+    {
+      "Sid": "DynamoDBListTables",
+      "Effect": "Allow",
+      "Action": ["dynamodb:ListTables", "dynamodb:DescribeLimits"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Route53ZonaPrivada",
+      "Effect": "Allow",
+      "Action": "route53:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "CloudMapServiceDiscovery",
+      "Effect": "Allow",
+      "Action": "servicediscovery:*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "VpcLeituraParaZonaPrivada",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeVpcs", "ec2:DescribeRegions", "ec2:DescribeInstances"],
+      "Resource": "*"
+    }
+  ]
+}
