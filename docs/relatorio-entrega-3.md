@@ -14,9 +14,9 @@
 
 > **Status deste documento:** rascunho estrutural. Os trechos marcados com **[EVIDÊNCIA PENDENTE]**
 > devem receber prints do console AWS e a saída de `scripts/test_entrega3.py` (issue #10) antes da
-> exportação para PDF (ver seção 9). Partes da arquitetura descrita ainda estão em PRs abertos:
-> infraestrutura (#25), nomeação (#26), reserva atômica e liberação (#21), Lamport no `rental-service`
-> (issue #6). Revise o texto depois do merge de cada um.
+> exportação para PDF (ver seção 9). Já estão em `dev`: reserva e liberação atômicas (#21), painel de
+> locações (#22) e `/discovery` com Lamport nos dois serviços (#24). Ainda em PRs abertos: infraestrutura
+> (#25) e nomeação (#26). Revise o texto depois do merge de cada um.
 
 ---
 
@@ -132,9 +132,10 @@ UpdateItem gamerent_games
   o 409 ao cliente.
 - A devolução faz a operação inversa (`RENTED → AVAILABLE`, limpando `current_rental_id`).
 
-> **Estado atual:** o endpoint atômico de reserva e liberação está no PR #21, ainda não mergeado. Em
-> `dev`, o fluxo continua sendo `GET` + `PATCH /status`, com `put_item` incondicional. A ausência de
-> *double-booking* só pode ser afirmada depois do CA-02 (seção 3.4).
+> **Estado atual:** o fluxo atômico entrou em `dev` com o PR #21 (`POST /games/{id}/reserve` e
+> `/release`, `ConditionExpression` no DynamoDB e 409 propagado pelo `rental-service`). O `test_issue_14`
+> já comprova o 409 em reservas sequenciais. A ausência de *double-booking* sob concorrência real só pode
+> ser afirmada depois do CA-02 (seção 3.4).
 
 ### 3.3. Relógio lógico de Lamport (issue #6)
 
