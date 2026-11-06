@@ -199,7 +199,24 @@ async def create_rental(
         "returned_at": None
     }
 
-    resp_obj = _save_rental(rental_record)
+    try:
+        resp_obj = _save_rental(rental_record)
+    except Exception as exc:
+        logger.error(f"[LAMPORT={clock}] Falha ao persistir locação {rental_id}: {exc}. Executando rollback compensatório no catálogo.")
+        try:
+            await catalog_client.release_game(
+                game_id=payload.game_id,
+                rental_id=rental_id,
+                lamport_clock=clock
+            )
+        except Exception as rollback_err:
+            logger.critical(f"Falha catastrófica ao tentar compensar reserva do jogo {payload.game_id}: {rollback_err}")
+        response.headers["X-Lamport-Clock"] = str(clock)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Erro interno ao registrar locação. A reserva do exemplar foi cancelada: {exc}"
+        )
+
     logger.info(f"[LAMPORT={clock}] Aluguel confirmado com sucesso! ID={rental_id}, URN={resp_obj.urn}, Total=R$ {total_price}")
     return resp_obj
 
