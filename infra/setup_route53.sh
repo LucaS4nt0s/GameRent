@@ -46,8 +46,14 @@ for attr in enableDnsSupport enableDnsHostnames; do
   fi
 done
 
-ZONE_ID="$(aws route53 list-hosted-zones-by-name --dns-name "$ZONE_NAME." \
-  --query "HostedZones[?Name=='$ZONE_NAME.' && Config.PrivateZone].Id | [0]" --output text)"
+ZONE_IDS="$(aws route53 list-hosted-zones-by-name --dns-name "$ZONE_NAME." \
+  --query "HostedZones[?Name=='$ZONE_NAME.' && Config.PrivateZone].Id" --output text)"
+read -r -a ZONE_LIST <<<"$ZONE_IDS"
+if (( ${#ZONE_LIST[@]} > 1 )); then
+  echo "Há ${#ZONE_LIST[@]} zonas privadas $ZONE_NAME (${ZONE_LIST[*]}). Remova as extras ou rode com ZONE_ID=<id>." >&2
+  exit 1
+fi
+ZONE_ID="${ZONE_ID:-${ZONE_LIST[0]:-None}}"
 
 if [[ "$ZONE_ID" == "None" || -z "$ZONE_ID" ]]; then
   echo "==> Criando zona privada $ZONE_NAME"

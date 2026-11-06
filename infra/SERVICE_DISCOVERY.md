@@ -58,3 +58,11 @@ suba o `rental-service` com `CATALOG_SERVICE_URL=http://catalog.gamerent.interna
 > Alternativa: um namespace DNS privado no AWS Cloud Map (`aws servicediscovery create-private-dns-namespace`)
 > cria a mesma zona no Route 53 e permite registrar instâncias por API. Para uma única EC2, a zona privada
 > direta é mais simples e tem o mesmo efeito na resolução.
+
+## Contrato do `GET /discovery`
+
+Cada resolução tem limite de `DNS_TIMEOUT_S` (padrão 2 s), então um nome inexistente não trava o endpoint
+nem as chamadas S2S. Além dos campos de nomeação (`node_urn`, `urn_schema`, `dns[]`, `local_ips`, `region`),
+a resposta inclui `dns_target`, `dns_resolution{status: RESOLVED|UNRESOLVED}`, `local_ip`,
+`dynamodb{table_name, mode}` e `timestamp`, no mesmo formato do `/discovery` do PR #24 (issue #16). No
+`catalog-service`, consultar o endpoint sincroniza o relógio de Lamport com o header `X-Lamport-Clock`.

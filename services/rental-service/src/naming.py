@@ -14,11 +14,13 @@ Este arquivo é idêntico em catalog-service e rental-service (cada serviço tem
 imagem Docker); mantenha os dois em sincronia.
 """
 import asyncio
+import concurrent.futures
 import logging
 import os
 import re
 import socket
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote, urlparse
 
@@ -27,6 +29,9 @@ logger = logging.getLogger("gamerent.naming")
 NAMESPACE = "urn:gamerent"
 DEFAULT_REGION = "sa-east-1"
 INTERNAL_DOMAIN = "gamerent.internal"
+# Limite por resolução: um nome que não existe não pode travar o /discovery nem a chamada S2S
+DNS_TIMEOUT_S = float(os.getenv("DNS_TIMEOUT_S", "2"))
+_dns_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="dns")
 
 # Segmentos usam o conjunto seguro de RFC 8141; qualquer outro caractere vira %XX (ver _segment)
 _SEGMENT = r"[A-Za-z0-9._%-]+"
@@ -96,29 +101,39 @@ def host_of(target: str) -> str:
     return parsed.hostname or target
 
 
+def _dns_result(host: str, infos=None, error: Optional[str] = None) -> dict:
+    if error is not None:
+        logger.warning(f"[DNS] Falha ao resolver {host}: {error}")
+        return {"hostname": host, "resolved_ips": [], "resolved": False, "status": "UNRESOLVED", "error": error}
+    ips = sorted({info[4][0] for info in infos})
+    logger.info(f"[DNS] {host} -> {', '.join(ips)}")
+    return {"hostname": host, "resolved_ips": ips, "resolved": True, "status": "RESOLVED", "error": None}
+
+
 def resolve(target: str) -> dict:
     """Resolve um nome simbólico via DNS (socket.getaddrinfo) e registra a tradução nos logs."""
     host = host_of(target)
+    future = _dns_pool.submit(socket.getaddrinfo, host, None, proto=socket.IPPROTO_TCP)
     try:
-        ips = sorted({info[4][0] for info in socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)})
-        logger.info(f"[DNS] {host} -> {', '.join(ips)}")
-        return {"hostname": host, "resolved_ips": ips, "resolved": True, "error": None}
+        return _dns_result(host, future.result(timeout=DNS_TIMEOUT_S))
+    except concurrent.futures.TimeoutError:
+        return _dns_result(host, error=f"timeout após {DNS_TIMEOUT_S}s")
     except socket.gaierror as exc:
-        logger.warning(f"[DNS] Falha ao resolver {host}: {exc}")
-        return {"hostname": host, "resolved_ips": [], "resolved": False, "error": str(exc)}
+        return _dns_result(host, error=str(exc))
 
 
 async def resolve_async(target: str) -> dict:
     """Igual a resolve(), mas sem bloquear o event loop (para handlers async)."""
     host = host_of(target)
     try:
-        infos = await asyncio.get_running_loop().getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
-        ips = sorted({info[4][0] for info in infos})
-        logger.info(f"[DNS] {host} -> {', '.join(ips)}")
-        return {"hostname": host, "resolved_ips": ips, "resolved": True, "error": None}
+        infos = await asyncio.wait_for(
+            asyncio.get_running_loop().getaddrinfo(host, None, proto=socket.IPPROTO_TCP), DNS_TIMEOUT_S
+        )
+        return _dns_result(host, infos)
+    except asyncio.TimeoutError:
+        return _dns_result(host, error=f"timeout após {DNS_TIMEOUT_S}s")
     except socket.gaierror as exc:
-        logger.warning(f"[DNS] Falha ao resolver {host}: {exc}")
-        return {"hostname": host, "resolved_ips": [], "resolved": False, "error": str(exc)}
+        return _dns_result(host, error=str(exc))
 
 
 def local_ips() -> list[str]:
@@ -128,18 +143,34 @@ def local_ips() -> list[str]:
         return []
 
 
-def discovery_info(service_name: str, dns_targets: list[str], lamport_clock: Optional[int]) -> dict:
-    """Metadados de nomeação do nó atual, servidos em GET /discovery."""
+def discovery_info(
+    service_name: str,
+    dns_targets: list[str],
+    lamport_clock: Optional[int],
+    dynamodb: Optional[dict] = None,
+) -> dict:
+    """Metadados de nomeação do nó atual, servidos em GET /discovery.
+
+    Os campos dns_target, dns_resolution, local_ip, dynamodb e timestamp seguem o contrato do
+    /discovery do PR #24 (issue #16), para que os dois PRs convivam no merge.
+    """
+    dns = [resolve(t) for t in dns_targets]
+    ips = local_ips()
     return {
         "service": service_name,
         "node_urn": node_urn(service_name),
         "instance_id": instance_id(),
         "region": region(),
         "hostname": socket.gethostname(),
-        "local_ips": local_ips(),
+        "local_ip": ips[0] if ips else None,
+        "local_ips": ips,
         "internal_domain": INTERNAL_DOMAIN,
-        "dns": [resolve(t) for t in dns_targets],
+        "dns_target": dns_targets[0] if dns_targets else None,
+        "dns_resolution": dns[0] if dns else None,
+        "dns": dns,
+        "dynamodb": dynamodb,
         "lamport_clock": lamport_clock,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "urn_schema": {
             "node": f"{NAMESPACE}:node:{{service_name}}:{{instance_id}}",
             "game": f"{NAMESPACE}:game:{{region}}:{{game_id}}",

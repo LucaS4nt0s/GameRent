@@ -3,6 +3,8 @@
 Pré-requisito: catalog-service em :8001 e rental-service em :8002 (docker compose up -d --build).
 Valida os URNs com o próprio parser do serviço (naming.parse_urn).
 """
+from __future__ import annotations
+
 import json
 import pathlib
 import sys
@@ -51,7 +53,11 @@ if __name__ == "__main__":
         check("node", disc["node_urn"])
         assert set(disc["urn_schema"]) == {"node", "game", "rental", "owner"}
         for entry in disc["dns"]:
-            assert {"hostname", "resolved_ips", "resolved"} <= entry.keys()
+            assert {"hostname", "resolved_ips", "resolved", "status"} <= entry.keys()
+        # Campos compartilhados com o /discovery do PR #24 (issue #16)
+        assert {"local_ip", "dns_target", "dns_resolution", "dynamodb", "timestamp"} <= disc.keys()
+        assert disc["dns_resolution"]["status"] in ("RESOLVED", "UNRESOLVED")
+        assert disc["dynamodb"]["mode"] in ("AWS_DYNAMODB", "LOCAL_DYNAMODB", "IN_MEMORY_FALLBACK")
         resolved = [e for e in disc["dns"] if e["resolved"]]
         print(f"      {service}: " + ("; ".join(f"{e['hostname']} -> {e['resolved_ips']}" for e in resolved) or "nenhum nome resolvido"))
         if service == "rental-service":

@@ -55,8 +55,10 @@ def health_check():
 @app.get("/discovery", tags=["Monitoramento"])
 def discovery():
     """Metadados de nomeação do nó e resolução DNS do catalog-service (nome simbólico -> IP)."""
-    targets = [f"rental.{naming.INTERNAL_DOMAIN}", catalog_client.base_url]
-    return naming.discovery_info(SERVICE_NAME, targets, lamport_clock=None)
+    targets = [catalog_client.base_url, f"rental.{naming.INTERNAL_DOMAIN}"]
+    # As locações ainda ficam em memória neste serviço (persistência no DynamoDB: issue #9)
+    dynamodb = {"table_name": os.getenv("RENTALS_TABLE_NAME", "gamerent_rentals"), "mode": "IN_MEMORY_FALLBACK"}
+    return naming.discovery_info(SERVICE_NAME, targets, lamport_clock=None, dynamodb=dynamodb)
 
 
 def log_dns_resolution():

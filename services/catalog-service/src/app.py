@@ -235,10 +235,24 @@ def health_check():
     }
 
 
+def _dynamodb_status() -> dict:
+    table = _get_ddb_table()
+    if table is None:
+        mode = "IN_MEMORY_FALLBACK"
+    elif os.getenv("DYNAMODB_ENDPOINT_URL"):
+        mode = "LOCAL_DYNAMODB"
+    else:
+        mode = "AWS_DYNAMODB"
+    return {"table_name": os.getenv("GAMES_TABLE_NAME", "gamerent_games"), "mode": mode}
+
+
 @app.get("/discovery", tags=["Monitoramento"])
-def discovery():
+def discovery(response: Response, x_lamport_clock: Optional[int] = Header(default=None)):
     """Metadados de nomeação do nó: URN, INSTANCE_ID, esquema de URNs e resolução DNS interna."""
-    return naming.discovery_info(SERVICE_NAME, DNS_TARGETS, _lamport_clock)
+    # Consultar o nó é um evento recebido: sincroniza o relógio com o do chamador (Lamport)
+    clock = tick_lamport(x_lamport_clock)
+    response.headers["X-Lamport-Clock"] = str(clock)
+    return naming.discovery_info(SERVICE_NAME, DNS_TARGETS, clock, _dynamodb_status())
 
 
 def log_dns_resolution():
