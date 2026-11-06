@@ -1,6 +1,8 @@
 import logging
 import os
+import socket
 import threading
+import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional
@@ -8,6 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import (
+    ConsistencyMode,
     Game,
     GameCreateRequest,
     GameNearbyResponse,
@@ -18,6 +21,8 @@ from models import (
     StatusUpdatePayload,
 )
 from geo_utils import calculate_haversine_distance
+
+NODE_URN = f"urn:gamerent:node:catalog-service:{os.getenv('INSTANCE_ID') or socket.gethostname()}"
 
 # Configuração de Logs
 logging.basicConfig(
@@ -116,7 +121,7 @@ GAMES_DB: dict[int, Game] = {
     )
 }
 
-# ponytail: espelhamento write-through opcional; leituras seguem em GAMES_DB até a issue de repositório
+# ponytail: scan/get_item com ConsistentRead e filtro Haversine em memória; usar GeoIndex/GSI se acervo crescer >10k itens
 _ddb_table = None
 
 
@@ -201,7 +206,47 @@ def _save_game(game: Game) -> GamePublicResponse:
             _put_ddb_game(table, game)
         except Exception as exc:
             logger.warning(f"Falha ao persistir jogo {game.id} no DynamoDB: {exc}")
-    return GamePublicResponse(**game.model_dump())
+    return GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN)
+
+
+def _read_games(consistency: ConsistencyMode) -> tuple[list[Game], float]:
+    table = _get_ddb_table()
+    t0 = time.perf_counter()
+    if table is not None:
+        try:
+            items = table.scan(ConsistentRead=(consistency == "strong")).get("Items", [])
+            games = sorted((Game(**it) for it in items), key=lambda g: g.id)
+            return games, round((time.perf_counter() - t0) * 1000, 3)
+        except Exception as exc:
+            logger.warning(f"Falha ao ler catálogo no DynamoDB: {exc}")
+    return list(GAMES_DB.values()), round((time.perf_counter() - t0) * 1000, 3)
+
+
+def _read_game(game_id: int, consistency: ConsistencyMode) -> tuple[Optional[Game], float]:
+    table = _get_ddb_table()
+    t0 = time.perf_counter()
+    if table is not None:
+        try:
+            item = table.get_item(Key={"id": game_id}, ConsistentRead=(consistency == "strong")).get("Item")
+            return (Game(**item) if item else None), round((time.perf_counter() - t0) * 1000, 3)
+        except Exception as exc:
+            logger.warning(f"Falha ao ler jogo {game_id} no DynamoDB: {exc}")
+    return GAMES_DB.get(game_id), round((time.perf_counter() - t0) * 1000, 3)
+
+
+def _set_read_headers(response: Response, consistency: ConsistencyMode, latency_ms: float) -> dict:
+    response.headers["X-Consistency-Mode"] = consistency
+    response.headers["X-DB-Read-Latency-Ms"] = str(latency_ms)
+    response.headers["X-Served-By-Node"] = NODE_URN
+    return {"consistency_mode": consistency, "db_read_latency_ms": latency_ms, "served_by_node": NODE_URN}
+
+
+def _matches(g: Game, status_filter: Optional[GameStatus], category: Optional[str], owner_id: Optional[str]) -> bool:
+    return (
+        (not status_filter or g.status == status_filter)
+        and (not category or g.category.lower() == category.strip().lower())
+        and (not owner_id or g.owner_id == owner_id)
+    )
 
 
 @app.get("/health", tags=["Monitoramento"])
@@ -210,6 +255,7 @@ def health_check():
     return {
         "status": "HEALTHY",
         "service": "catalog-service",
+        "node_urn": NODE_URN,
         "total_games": len(GAMES_DB),
         "lamport_clock": _lamport_clock
     }
@@ -233,45 +279,58 @@ def create_game(
 
 
 @app.get("/games", response_model=List[GamePublicResponse], tags=["Catálogo"])
-def list_games(status_filter: Optional[GameStatus] = None, owner_id: Optional[str] = None):
-    """Lista todos os jogos, omitindo coordenadas sensíveis de GPS."""
-    logger.info("Listagem de jogos solicitada.")
+def list_games(
+    response: Response,
+    status_filter: Optional[GameStatus] = None,
+    category: Optional[str] = None,
+    owner_id: Optional[str] = None,
+    consistency: ConsistencyMode = "strong",
+):
+    """FA-02: Lista jogos com filtros opcionais e seletor de consistência, omitindo coordenadas de GPS."""
+    games, latency_ms = _read_games(consistency)
+    meta = _set_read_headers(response, consistency, latency_ms)
     return [
-        GamePublicResponse(**g.model_dump())
-        for g in GAMES_DB.values()
-        if (not status_filter or g.status == status_filter)
-        and (not owner_id or g.owner_id == owner_id)
+        GamePublicResponse(**g.model_dump(), **meta)
+        for g in games
+        if _matches(g, status_filter, category, owner_id)
     ]
 
 
 @app.get("/games/nearby", response_model=List[GameNearbyResponse], tags=["Catálogo"])
 def list_nearby_games(
-    lat: float = Query(..., description="Latitude do locatário"),
-    lon: float = Query(..., description="Longitude do locatário"),
-    max_km: float = Query(10.0, description="Raio máximo de busca em km")
+    response: Response,
+    lat: float = Query(..., ge=-90.0, le=90.0, description="Latitude do locatário"),
+    lon: float = Query(..., ge=-180.0, le=180.0, description="Longitude do locatário"),
+    max_km: float = Query(10.0, gt=0, description="Raio máximo de busca em km"),
+    status_filter: Optional[GameStatus] = None,
+    category: Optional[str] = None,
+    owner_id: Optional[str] = None,
+    consistency: ConsistencyMode = "strong",
 ):
-    """Calcula a distância haversine sem expor as coordenadas reais do locador."""
-    logger.info(f"Busca geográfica recebida: lat={lat}, lon={lon}, max_km={max_km}")
+    """FA-02: Calcula a distância Haversine em memória sem expor as coordenadas reais do locador."""
+    games, latency_ms = _read_games(consistency)
+    meta = _set_read_headers(response, consistency, latency_ms)
     results = [
-        GameNearbyResponse(**g.model_dump(), distance_km=dist)
-        for g in GAMES_DB.values()
-        if (dist := calculate_haversine_distance(lat, lon, g.latitude, g.longitude)) <= max_km
+        GameNearbyResponse(**g.model_dump(), **meta, distance_km=dist)
+        for g in games
+        if _matches(g, status_filter, category, owner_id)
+        and (dist := calculate_haversine_distance(lat, lon, g.latitude, g.longitude)) <= max_km
     ]
     results.sort(key=lambda x: x.distance_km)
     return results
 
 
 @app.get("/games/{game_id}", response_model=GamePublicResponse, tags=["Catálogo"])
-def get_game_by_id(game_id: int):
-    """Consulta um jogo específico."""
-    logger.info(f"Consulta de jogo ID={game_id} solicitada.")
-    if game_id not in GAMES_DB:
-        logger.warning(f"Jogo ID={game_id} não encontrado.")
+def get_game_by_id(game_id: int, response: Response, consistency: ConsistencyMode = "strong"):
+    """Consulta um jogo específico com seletor de consistência."""
+    game, latency_ms = _read_game(game_id, consistency)
+    meta = _set_read_headers(response, consistency, latency_ms)
+    if game is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Jogo com ID {game_id} não encontrado no catálogo."
         )
-    return GamePublicResponse(**GAMES_DB[game_id].model_dump())
+    return GamePublicResponse(**game.model_dump(), **meta)
 
 
 @app.patch("/games/{game_id}/status", response_model=GamePublicResponse, tags=["Catálogo"])
