@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
 ConsistencyMode = Literal["strong", "eventual"]
@@ -75,3 +75,30 @@ class GameNearbyResponse(GamePublicResponse):
 
 class StatusUpdatePayload(BaseModel):
     status: GameStatus
+
+
+class DNSResolutionInfo(BaseModel):
+    target_hostname: str
+    resolved_ips: List[str]
+    status: str
+    error_message: Optional[str] = None
+
+
+class DynamoDBStatusInfo(BaseModel):
+    connected: bool
+    table_name: str
+    mode: str
+    endpoint_url: Optional[str] = None
+
+
+class DiscoveryResponse(BaseModel):
+    service: str
+    node_urn: str
+    instance_id: str
+    hostname: str
+    local_ip: str
+    dns_target: str
+    dns_resolution: DNSResolutionInfo
+    lamport_clock: int
+    dynamodb: DynamoDBStatusInfo
+    timestamp: str
