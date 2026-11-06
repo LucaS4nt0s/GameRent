@@ -23,6 +23,17 @@ class GameCreateRequest(BaseModel):
     longitude: float = Field(..., ge=-180.0, le=180.0)
 
 
+class GameReserveRequest(BaseModel):
+    rental_id: str = Field(..., min_length=1, description="UUID da locação gerado pelo rental-service")
+    renter_name: str = Field(..., min_length=1, description="Nome do locatário")
+    renter_email: Optional[str] = Field(None, description="E-mail do locatário (opcional)")
+
+
+class GameReleaseRequest(BaseModel):
+    rental_id: Optional[str] = Field(None, description="UUID da locação que está sendo encerrada (opcional)")
+    force: bool = Field(False, description="Liberação administrativa forçada ignorando validação de rental_id")
+
+
 class _GameBase(BaseModel):
     id: int
     urn: str = ""
@@ -34,9 +45,10 @@ class _GameBase(BaseModel):
     owner_id: str
     owner_urn: str = ""
     owner_name: str
-    current_rental_id: Optional[str] = None
     version: int = 1
     lamport_clock: int = 1
+    current_rental_id: Optional[str] = None
+    current_renter_name: Optional[str] = None
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def model_post_init(self, __context) -> None:
