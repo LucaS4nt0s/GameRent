@@ -330,7 +330,8 @@ A Entrega 3 leva o GameRent de um protótipo com estado em memória para uma arq
 
 ## 9. Como gerar o PDF
 
-Depois de inserir as evidências (imagens em `docs/diagrams/`, que não são versionadas):
+Salve os prints em `docs/diagrams/entrega-3/` (pasta versionada) e referencie-os com caminho relativo,
+por exemplo `![Route 53](diagrams/entrega-3/route53-zona-privada.png)`. Depois:
 
 ```bash
 pandoc docs/relatorio-entrega-3.md -s -o docs/relatorio-entrega-3.html --metadata title="GameRent — Entrega 3"

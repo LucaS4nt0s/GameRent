@@ -70,6 +70,8 @@ relatorio-entrega-*.md
 docs/*.html
 docs/diagrams/*
 !docs/diagrams/.gitkeep
+# Evidências da Entrega 3 são versionadas para os links do relatório funcionarem para todos
+!docs/diagrams/entrega-3/
 docs/*.png
 docs/*.jpg
 docs/*.jpeg
