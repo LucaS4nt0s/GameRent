@@ -36,7 +36,7 @@ Na AWS, o nome simbólico `catalog.gamerent.internal` vem do Route 53 (issue #5)
 ```
 
 Cria a role `GameRentEC2Role` com a política [`iam/gamerent-ec2-policy.json`](iam/gamerent-ec2-policy.json)
-(`dynamodb:*` nas tabelas `gamerent_*`, `route53:*`, `servicediscovery:*`), cria o Instance Profile e
+(`dynamodb:*` nas tabelas `gamerent_*`; no Route 53, criar e ler zonas e alterar só registros `*.gamerent.internal`; no Cloud Map, só leitura e descoberta), cria o Instance Profile e
 o associa à instância. Nenhuma chave de acesso fica na EC2: o boto3 usa as credenciais temporárias da role.
 
 Validação dentro da EC2:

@@ -237,11 +237,13 @@ def _matches(g: Game, status_filter: Optional[GameStatus], category: Optional[st
 @app.get("/health", tags=["Monitoramento"])
 def health_check():
     """Endpoint de integridade para monitoramento (Health Check)."""
+    # Conta pela fonte de verdade (DynamoDB quando ativo), igual em todas as réplicas
+    games, _ = _read_games("eventual")
     return {
         "status": "HEALTHY",
         "service": "catalog-service",
         "node_urn": NODE_URN,
-        "total_games": len(GAMES_DB),
+        "total_games": len(games),
         "lamport_clock": _lamport_clock
     }
 

@@ -6,6 +6,8 @@ Valida que:
   2. as duas réplicas do catálogo (8001 e 8003) estão saudáveis e têm identidades distintas;
   3. um jogo cadastrado na réplica 1 é lido pela réplica 2 (estado compartilhado no DynamoDB).
 """
+from __future__ import annotations
+
 import json
 import time
 import urllib.error

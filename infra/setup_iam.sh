@@ -2,9 +2,10 @@
 # Provisiona a IAM Role da EC2 do GameRent (Entrega 3) e a anexa à instância.
 #
 # Permissões concedidas (infra/iam/gamerent-ec2-policy.json):
-#   - dynamodb:*          nas tabelas gamerent_* em sa-east-1 (+ ListTables)
-#   - route53:*           Route 53 (hoje em "*"; restringir ao ARN da zona gamerent.internal após criá-la)
-#   - servicediscovery:*  AWS Cloud Map
+#   - dynamodb:*   nas tabelas gamerent_* em sa-east-1 (+ ListTables)
+#   - Route 53     criar/ler zonas e alterar SOMENTE registros *.gamerent.internal
+#                  (condição route53:ChangeResourceRecordSetsNormalizedRecordNames)
+#   - Cloud Map    só descoberta/leitura (DiscoverInstances, Get*, List*)
 #
 # Uso (rodar da sua máquina, com AWS CLI configurado com um usuário administrador):
 #   ./infra/setup_iam.sh <EC2_INSTANCE_ID>
@@ -20,6 +21,10 @@ ROLE_NAME="${ROLE_NAME:-GameRentEC2Role}"
 PROFILE_NAME="${PROFILE_NAME:-GameRentEC2InstanceProfile}"
 POLICY_NAME="GameRentDistributedPolicy"
 DIR="$(cd "$(dirname "$0")" && pwd)"
+# No Git Bash do Windows o aws.exe não entende caminhos /c/...: converte para C:/...
+if command -v cygpath >/dev/null 2>&1; then
+  DIR="$(cygpath -m "$DIR")"
+fi
 
 if [[ -z "$INSTANCE_ID" ]]; then
   echo "Uso: $0 <EC2_INSTANCE_ID>" >&2

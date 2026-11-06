@@ -17,15 +17,48 @@
       "Resource": "*"
     },
     {
-      "Sid": "Route53ZonaPrivada",
+      "Sid": "Route53SemRecursoEspecifico",
       "Effect": "Allow",
-      "Action": "route53:*",
+      "Action": [
+        "route53:ListHostedZones",
+        "route53:ListHostedZonesByName",
+        "route53:CreateHostedZone",
+        "route53:GetChange"
+      ],
       "Resource": "*"
     },
     {
-      "Sid": "CloudMapServiceDiscovery",
+      "Sid": "Route53LeituraZonas",
       "Effect": "Allow",
-      "Action": "servicediscovery:*",
+      "Action": [
+        "route53:GetHostedZone",
+        "route53:ListResourceRecordSets",
+        "route53:AssociateVPCWithHostedZone"
+      ],
+      "Resource": "arn:aws:route53:::hostedzone/*"
+    },
+    {
+      "Sid": "Route53SoRegistrosGameRentInternal",
+      "Effect": "Allow",
+      "Action": "route53:ChangeResourceRecordSets",
+      "Resource": "arn:aws:route53:::hostedzone/*",
+      "Condition": {
+        "ForAllValues:StringLike": {
+          "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
+            "gamerent.internal",
+            "*.gamerent.internal"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "CloudMapDescoberta",
+      "Effect": "Allow",
+      "Action": [
+        "servicediscovery:DiscoverInstances",
+        "servicediscovery:Get*",
+        "servicediscovery:List*"
+      ],
       "Resource": "*"
     },
     {
