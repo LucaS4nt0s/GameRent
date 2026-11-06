@@ -7,6 +7,9 @@ const STATUS_LABEL = {
   MAINTENANCE: 'Manutenção',
 }
 
+// Intervalo do "tempo real": catálogo, locações e relógio de Lamport são relidos em segundo plano
+const POLL_MS = 3000
+
 const THUMBS = [
   'linear-gradient(135deg,#00A650,#00D26A)',
   'linear-gradient(135deg,#0B7A3B,#12B76A)',
@@ -31,6 +34,7 @@ export default function App() {
   const [games, setGames] = useState([])
   const [rentals, setRentals] = useState([])
   const [health, setHealth] = useState({ catalog: null, rental: null })
+  const [node, setNode] = useState({ urn: '', lamport: null, updatedAt: null })
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const [loading, setLoading] = useState(false)
@@ -39,6 +43,7 @@ export default function App() {
   const [category, setCategory] = useState('Todas')
 
   const [nearby, setNearby] = useState(null)
+  const [coords, setCoords] = useState(null)
   const [locating, setLocating] = useState(false)
 
   const [renting, setRenting] = useState(null)
@@ -75,6 +80,7 @@ export default function App() {
     try {
       const data = await api.catalog.health()
       setHealth((h) => ({ ...h, catalog: data.status }))
+      setNode({ urn: data.node_urn || '', lamport: data.lamport_clock ?? null, updatedAt: new Date() })
     } catch {
       setHealth((h) => ({ ...h, catalog: 'DOWN' }))
     }
@@ -102,6 +108,23 @@ export default function App() {
     loadRentals()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Atualização silenciosa (sem "Carregando…"): status de bloqueio, versão e Lamport mudam ao vivo
+  useEffect(() => {
+    const id = setInterval(async () => {
+      if (document.hidden) return
+      loadHealth()
+      try {
+        setGames(await api.catalog.listGames())
+        setRentals(await api.rental.listRentals())
+        if (coords) setNearby(await api.catalog.nearby(coords.lat, coords.lon, 50))
+      } catch {
+        // falhas transitórias aparecem no indicador de saúde do topo
+      }
+    }, POLL_MS)
+    return () => clearInterval(id)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [coords])
 
   function openRent(game) {
     setRenting(game)
@@ -151,6 +174,7 @@ export default function App() {
         const lon = pos.coords.longitude
         const data = await run(() => api.catalog.nearby(lat, lon, 50))
         if (data) {
+          setCoords({ lat, lon })
           setNearby(data)
           setTab('nearby')
         }
@@ -184,6 +208,11 @@ export default function App() {
             />
           </label>
           <span className={`pulse ${serviceUp ? 'ok' : 'down'}`} title={serviceUp ? 'Serviços online' : 'Serviço indisponível'} />
+        </div>
+        <div className="node-strip">
+          <span className="mono" title="Nó do catálogo que respondeu">{node.urn || 'nó desconhecido'}</span>
+          <span className="lamport" title="Relógio lógico de Lamport do nó">Lamport {node.lamport ?? '–'}</span>
+          {node.updatedAt && <span className="live">ao vivo · {node.updatedAt.toLocaleTimeString('pt-BR')}</span>}
         </div>
       </header>
 
@@ -239,25 +268,7 @@ export default function App() {
             <div className="grid">
               {nearby &&
                 nearby.map((g, i) => (
-                  <article className="card" key={g.id}>
-                    <div className="thumb" style={{ background: THUMBS[i % THUMBS.length] }}>
-                      <span>{initials(g.title)}</span>
-                      <span className="distance">{g.distance_km} km</span>
-                    </div>
-                    <div className="card-body">
-                      <div className="card-top">
-                        <h3>{g.title}</h3>
-                        <StatusPill status={g.status} />
-                      </div>
-                      <p className="muted">{g.category}</p>
-                      <div className="card-foot">
-                        <span className="price">R$ {g.price_per_day.toFixed(2)}<small>/dia</small></span>
-                        <button onClick={() => openRent(g)} disabled={g.status !== 'AVAILABLE'}>
-                          Alugar
-                        </button>
-                      </div>
-                    </div>
-                  </article>
+                  <GameCard key={g.id} game={g} thumb={THUMBS[i % THUMBS.length]} onRent={openRent} distance={g.distance_km} />
                 ))}
               {nearby && nearby.length === 0 && <p className="empty">Nenhum jogo num raio de 50 km.</p>}
               {!nearby && <p className="empty">Toque em "Usar minha localização" para ver jogos por perto.</p>}
@@ -275,7 +286,7 @@ export default function App() {
                   <div className="order-info">
                     <strong>{r.game_title}</strong>
                     <span className="muted">{r.rental_days} dia(s) · {r.renter_name}</span>
-                    <span className="muted mono">{r.rental_id.slice(0, 8)}</span>
+                    <span className="muted mono">{r.urn || r.rental_id.slice(0, 8)}</span>
                   </div>
                   <div className="order-right">
                     <span className="price">R$ {r.total_price.toFixed(2)}</span>
@@ -358,11 +369,13 @@ export default function App() {
   )
 }
 
-function GameCard({ game, thumb, onRent }) {
+function GameCard({ game, thumb, onRent, distance }) {
+  const locked = game.status !== 'AVAILABLE'
   return (
-    <article className="card">
+    <article className={locked ? 'card locked' : 'card'}>
       <div className="thumb" style={{ background: thumb }}>
         <span>{initials(game.title)}</span>
+        {distance !== undefined && <span className="distance">{distance} km</span>}
       </div>
       <div className="card-body">
         <div className="card-top">
@@ -371,6 +384,16 @@ function GameCard({ game, thumb, onRent }) {
         </div>
         <p className="muted">{game.category} · {game.owner_name}</p>
         <p className="desc">{game.description}</p>
+        <div className="dist-meta">
+          {game.urn && <span className="mono urn" title="URN do jogo">{game.urn}</span>}
+          <span className="lamport" title="Relógio de Lamport da última escrita">L={game.lamport_clock ?? '–'}</span>
+          <span title="Versão do item">v{game.version ?? 1}</span>
+        </div>
+        {game.status === 'RENTED' && (
+          <p className="lock-note">
+            Bloqueado{game.current_rental_id ? ` pela locação ${game.current_rental_id.slice(0, 8)}` : ' por locação ativa'}
+          </p>
+        )}
         <div className="card-foot">
           <span className="price">R$ {game.price_per_day.toFixed(2)}<small>/dia</small></span>
           <button onClick={() => onRent(game)} disabled={game.status !== 'AVAILABLE'}>

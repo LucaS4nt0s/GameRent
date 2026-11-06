@@ -382,6 +382,63 @@ input {
   color: #b26a00;
 }
 
+/* ---------- Metadados distribuídos (Entrega 3) ---------- */
+.node-strip {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 18px 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 0.72rem;
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.node-strip .mono {
+  overflow-wrap: anywhere;
+}
+
+.live::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: #b9f6ca;
+  vertical-align: middle;
+}
+
+.dist-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+
+.dist-meta .urn {
+  flex-basis: 100%;
+  overflow-wrap: anywhere;
+}
+
+.lamport {
+  font-weight: 700;
+}
+
+.dist-meta .lamport {
+  color: var(--green-dark);
+}
+
+.lock-note {
+  color: var(--red);
+  font-weight: 600;
+}
+
+.card.locked .thumb {
+  filter: grayscale(0.55);
+}
+
 /* ---------- Orders ---------- */
 .orders {
   display: flex;

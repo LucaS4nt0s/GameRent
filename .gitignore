@@ -64,6 +64,8 @@ relatorio-tecnico-gamerent_entrega.pdf
 # Relatórios em Markdown e imagens/diagramas locais (para enviar apenas o PDF final)
 docs/relatorio-entrega-2.md
 relatorio-entrega-*.md
+# Exceção: o relatório da Entrega 3 é versionado em Markdown (issue #11)
+!docs/relatorio-entrega-3.md
 docs/diagrams/*
 !docs/diagrams/.gitkeep
 docs/*.png
