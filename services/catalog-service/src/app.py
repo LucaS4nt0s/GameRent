@@ -241,11 +241,14 @@ def discovery():
     return naming.discovery_info(SERVICE_NAME, DNS_TARGETS, _lamport_clock)
 
 
-@app.on_event("startup")
 def log_dns_resolution():
     logger.info(f"Nó {NODE_URN} iniciado")
     for target in DNS_TARGETS:
         naming.resolve(target)
+
+
+# Executa uma vez ao carregar o módulo (antes de o uvicorn aceitar conexões)
+log_dns_resolution()
 
 
 @app.post("/games", response_model=GamePublicResponse, status_code=status.HTTP_201_CREATED, tags=["Catálogo"])

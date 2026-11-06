@@ -8,7 +8,7 @@ Implementado em `services/*/src/naming.py` (mesmo arquivo nos dois serviços).
 |--------------|--------------------------------------------------|---------------------------------------------------------------|
 | Serviço/Nó   | `urn:gamerent:node:{service_name}:{instance_id}` | `urn:gamerent:node:catalog-service:catalog-1`                 |
 | Jogo         | `urn:gamerent:game:{region}:{game_id}`           | `urn:gamerent:game:sa-east-1:3`                               |
-| Reserva      | `urn:gamerent:rental:{uuid_v4}`                  | `urn:gamerent:rental:4db0ddd6-3f6c-40d7-a62d-eef18e768ce2`    |
+| Reserva      | `urn:gamerent:rental:{uuid}` (gerado com uuid4)                  | `urn:gamerent:rental:4db0ddd6-3f6c-40d7-a62d-eef18e768ce2`    |
 | Locador      | `urn:gamerent:owner:{owner_id}`                  | `urn:gamerent:owner:locador-001`                              |
 
 `instance_id` vem da variável `INSTANCE_ID` (ou do hostname do container). `region` vem de `AWS_REGION`.
@@ -36,7 +36,12 @@ Os serviços registram cada tradução nome → IP com `socket.getaddrinfo`:
 
 O catálogo resolve seus próprios nomes ao iniciar (`DNS_DISCOVERY_TARGETS`, padrão
 `catalog.gamerent.internal,catalog-service`). O `rental-service` resolve o host de `CATALOG_SERVICE_URL`
-antes de cada chamada inter-serviços, então o log mostra para qual IP privado a requisição foi.
+antes de cada chamada inter-serviços (de forma assíncrona, sem travar o event loop). O log mostra os
+IPs candidatos; o httpx faz a própria resolução, então, se o nome tiver vários IPs, a conexão pode ir
+para qualquer um deles.
+
+Valores livres (como `owner_id` com `@` ou espaço, ou um `INSTANCE_ID` com `:`) são codificados com
+`%XX` (RFC 8141) para que todo URN gerado passe em `naming.parse_urn`.
 
 ## Provisionando na AWS
 

@@ -5,7 +5,8 @@
 #   catalog.gamerent.internal  A  <IP privado da EC2>
 #   rental.gamerent.internal   A  <IP privado da EC2>
 #
-# Uso (da sua máquina com AWS CLI admin, ou de dentro da EC2 com a role de infra/setup_iam.sh):
+# Uso (da sua máquina com AWS CLI admin; de dentro da EC2 a role de infra/setup_iam.sh basta se a VPC
+# já tiver enableDnsSupport/enableDnsHostnames ligados, pois a role não tem ec2:ModifyVpcAttribute):
 #   ./infra/setup_route53.sh <EC2_INSTANCE_ID>
 #
 # Idempotente (UPSERT). TTL baixo (60 s) para a troca de IP refletir rápido.
@@ -23,14 +24,27 @@ if [[ -z "$INSTANCE_ID" ]]; then
   exit 1
 fi
 
-read -r VPC_ID PRIVATE_IP < <(aws ec2 describe-instances \
+INFO="$(aws ec2 describe-instances \
   --region "$REGION" --instance-ids "$INSTANCE_ID" \
-  --query 'Reservations[0].Instances[0].[VpcId,PrivateIpAddress]' --output text)
+  --query 'Reservations[0].Instances[0].[VpcId,PrivateIpAddress]' --output text)"
+read -r VPC_ID PRIVATE_IP <<<"$INFO"
+if [[ -z "${VPC_ID:-}" || "$VPC_ID" == "None" || -z "${PRIVATE_IP:-}" ]]; then
+  echo "Não encontrei VPC/IP privado da instância $INSTANCE_ID em $REGION" >&2
+  exit 1
+fi
 echo "==> EC2 $INSTANCE_ID: VPC=$VPC_ID IP privado=$PRIVATE_IP"
 
-# A VPC precisa resolver DNS privado
-aws ec2 modify-vpc-attribute --region "$REGION" --vpc-id "$VPC_ID" --enable-dns-support '{"Value":true}'
-aws ec2 modify-vpc-attribute --region "$REGION" --vpc-id "$VPC_ID" --enable-dns-hostnames '{"Value":true}'
+# A VPC precisa resolver DNS privado; só altera o que estiver desligado
+for attr in enableDnsSupport enableDnsHostnames; do
+  enabled="$(aws ec2 describe-vpc-attribute --region "$REGION" --vpc-id "$VPC_ID" --attribute "$attr" \
+    --query "${attr^}.Value" --output text)"
+  if [[ "$enabled" != "True" ]]; then
+    echo "==> Ligando $attr na VPC $VPC_ID"
+    flag="--enable-dns-support"
+    [[ "$attr" == enableDnsHostnames ]] && flag="--enable-dns-hostnames"
+    aws ec2 modify-vpc-attribute --region "$REGION" --vpc-id "$VPC_ID" "$flag" '{"Value":true}'
+  fi
+done
 
 ZONE_ID="$(aws route53 list-hosted-zones-by-name --dns-name "$ZONE_NAME." \
   --query "HostedZones[?Name=='$ZONE_NAME.' && Config.PrivateZone].Id | [0]" --output text)"
@@ -45,8 +59,12 @@ if [[ "$ZONE_ID" == "None" || -z "$ZONE_ID" ]]; then
     --query 'HostedZone.Id' --output text)"
 else
   echo "==> Zona privada $ZONE_NAME já existe ($ZONE_ID)"
-  aws route53 associate-vpc-with-hosted-zone --hosted-zone-id "$ZONE_ID" \
-    --vpc "VPCRegion=$REGION,VPCId=$VPC_ID" >/dev/null 2>&1 || true
+  ASSOCIATED="$(aws route53 get-hosted-zone --id "$ZONE_ID" \
+    --query "VPCs[?VPCId=='$VPC_ID'] | length(@)" --output text)"
+  if [[ "$ASSOCIATED" == "0" ]]; then
+    aws route53 associate-vpc-with-hosted-zone --hosted-zone-id "$ZONE_ID" \
+      --vpc "VPCRegion=$REGION,VPCId=$VPC_ID" >/dev/null
+  fi
 fi
 ZONE_ID="${ZONE_ID##*/}"
 

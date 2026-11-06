@@ -33,7 +33,11 @@ class RentalResponse(BaseModel):
 
     def model_post_init(self, __context) -> None:
         if not self.urn:
-            self.urn = naming.rental_urn(self.rental_id)
+            try:
+                self.urn = naming.rental_urn(self.rental_id)
+            except ValueError:
+                # Registro legado com id fora do padrão UUID: não derruba a listagem inteira
+                self.urn = ""
         if not self.game_urn:
             self.game_urn = naming.game_urn(self.game_id)
         if not self.served_by_node:

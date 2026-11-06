@@ -59,10 +59,13 @@ def discovery():
     return naming.discovery_info(SERVICE_NAME, targets, lamport_clock=None)
 
 
-@app.on_event("startup")
 def log_dns_resolution():
     logger.info(f"Nó {NODE_URN} iniciado; catálogo em {catalog_client.base_url}")
     naming.resolve(catalog_client.base_url)
+
+
+# Executa uma vez ao carregar o módulo (antes de o uvicorn aceitar conexões)
+log_dns_resolution()
 
 
 @app.post("/rentals", response_model=RentalResponse, status_code=status.HTTP_201_CREATED, tags=["Locações"])
@@ -128,7 +131,9 @@ async def create_rental(payload: RentalCreateRequest):
         "daily_rate": daily_rate,
         "total_price": total_price,
         "status": RentalStatus.CONFIRMED,
-        "created_at": created_at_iso
+        "created_at": created_at_iso,
+        # URN canônico vem do catálogo (dono do recurso), não é recalculado com a região deste nó
+        "game_urn": game_data.get("urn", ""),
     }
 
     RENTALS_DB[rental_id] = rental_record

@@ -30,7 +30,8 @@ class CatalogClient:
         Realiza chamada síncrona HTTP GET para obter detalhes e status do jogo.
         """
         url = f"{self.base_url}/games/{game_id}"
-        naming.resolve(self.base_url)
+        # Não bloqueia o event loop. O httpx resolve de novo: com vários IPs o log lista os candidatos
+        await naming.resolve_async(self.base_url)
         logger.info(f"Disparando chamada RPC/REST síncrona: GET {url}")
 
         try:
@@ -56,7 +57,8 @@ class CatalogClient:
         Atualiza o status do jogo no catálogo remoto para RENTED ou AVAILABLE.
         """
         url = f"{self.base_url}/games/{game_id}/status"
-        naming.resolve(self.base_url)
+        # Não bloqueia o event loop. O httpx resolve de novo: com vários IPs o log lista os candidatos
+        await naming.resolve_async(self.base_url)
         logger.info(f"Disparando chamada RPC/REST síncrona: PATCH {url} com status={new_status}")
 
         try:
