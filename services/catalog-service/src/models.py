@@ -29,6 +29,7 @@ class GameReserveRequest(BaseModel):
 
 class GameReleaseRequest(BaseModel):
     rental_id: Optional[str] = Field(None, description="UUID da locação que está sendo encerrada (opcional)")
+    force: bool = Field(False, description="Liberação administrativa forçada ignorando validação de rental_id")
 
 
 class _GameBase(BaseModel):

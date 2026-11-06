@@ -419,6 +419,7 @@ def reserve_game(
     """
     FA-03 / FA-04: Reserva atômica de exemplar para locação.
     Garante exclusão mútua: se o jogo não estiver AVAILABLE, rejeita imediatamente com 409 Conflict.
+    Suporta retentativas idempotentes para a mesma locação (mesmo rental_id).
     """
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
@@ -433,6 +434,12 @@ def reserve_game(
             )
 
         game = GAMES_DB[game_id]
+
+        # Idempotência: se já estiver RENTED para o mesmo rental_id, confirma sem erro
+        if game.status == GameStatus.RENTED and game.current_rental_id == payload.rental_id:
+            logger.info(f"[LAMPORT={clock}] Retentativa idempotente de reserva confirmada para jogo ID={game_id} (Rental={payload.rental_id}).")
+            return _save_game(game)
+
         if game.status != GameStatus.AVAILABLE:
             logger.warning(f"[LAMPORT={clock}] Conflito 409: Jogo ID={game_id} indisponível para reserva (status atual: {game.status})")
             raise HTTPException(
@@ -440,18 +447,10 @@ def reserve_game(
                 detail=f"O jogo '{game.title}' não está disponível para reserva no momento (status atual: {game.status})."
             )
 
-        # Atualiza trava condicional no DynamoDB se configurado
-        table = _get_ddb_table()
-        if table is not None:
-            try:
-                _reserve_ddb_game(table, game_id, payload.rental_id, payload.renter_name, clock)
-            except Exception as exc:
-                if "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc):
-                    logger.warning(f"[LAMPORT={clock}] DynamoDB ConditionalCheckFailedException para jogo ID={game_id}")
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=f"Conflito de concorrência: o jogo '{game.title}' acabou de ser reservado por outro locatário."
-                    )
+        prev_status = game.status
+        prev_rental = game.current_rental_id
+        prev_renter = game.current_renter_name
+        prev_ver = game.version
 
         game.status = GameStatus.RENTED
         game.current_rental_id = payload.rental_id
@@ -459,6 +458,25 @@ def reserve_game(
         game.version += 1
         game.lamport_clock = clock
         game.updated_at = datetime.now(timezone.utc).isoformat()
+
+    # I/O DynamoDB executado fora do lock em memória para evitar thread starvation
+    table = _get_ddb_table()
+    if table is not None:
+        try:
+            _reserve_ddb_game(table, game_id, payload.rental_id, payload.renter_name, clock)
+        except Exception as exc:
+            with _lock:
+                game.status = prev_status
+                game.current_rental_id = prev_rental
+                game.current_renter_name = prev_renter
+                game.version = prev_ver
+            if "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc):
+                logger.warning(f"[LAMPORT={clock}] DynamoDB ConditionalCheckFailedException para jogo ID={game_id}")
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Conflito de concorrência: o jogo '{game.title}' acabou de ser reservado por outro locatário."
+                )
+            logger.warning(f"Erro ao persistir reserva no DynamoDB: {exc}")
 
     logger.info(f"[LAMPORT={clock}] Jogo ID={game_id} reservado com sucesso para rental {payload.rental_id}.")
     return _save_game(game)
@@ -469,15 +487,19 @@ def release_game(
     game_id: int,
     response: Response,
     payload: Optional[GameReleaseRequest] = None,
+    force: bool = Query(False, description="Liberação administrativa forçada ignorando validação de rental_id"),
     x_lamport_clock: Optional[int] = Header(default=None)
 ):
     """
     FB-01: Liberação atômica de exemplar alugado.
     Restaura status para AVAILABLE e limpa vínculos de locação ativa.
+    Exige validação do rental_id da locação ativa para prevenir liberações desautorizadas.
     """
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
     logger.info(f"[LAMPORT={clock}] Liberação de exemplar solicitada para o jogo ID={game_id}")
+
+    is_forced = force or (payload.force if payload else False)
 
     with _lock:
         if game_id not in GAMES_DB:
@@ -488,6 +510,21 @@ def release_game(
             )
 
         game = GAMES_DB[game_id]
+
+        # Validação de segurança: se o jogo estiver RENTED com um rental_id ativo,
+        # exige confirmação do rental_id correspondente (salvo se liberação forçada)
+        if not is_forced and game.status == GameStatus.RENTED and game.current_rental_id:
+            provided_rental_id = payload.rental_id if payload else None
+            if not provided_rental_id or provided_rental_id != game.current_rental_id:
+                logger.warning(
+                    f"[LAMPORT={clock}] Conflito 409 na liberação: rental_id fornecido '{provided_rental_id}' "
+                    f"não coincide com a locação ativa '{game.current_rental_id}' do jogo ID={game_id}."
+                )
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Operação negada: o rental_id informado não corresponde à locação ativa do jogo '{game.title}'."
+                )
+
         game.status = GameStatus.AVAILABLE
         game.current_rental_id = None
         game.current_renter_name = None
