@@ -3,6 +3,8 @@ import logging
 from typing import Optional, Dict, Any
 import httpx
 
+import naming
+
 logger = logging.getLogger("rental-service.catalog-client")
 
 class CatalogCommunicationError(Exception):
@@ -28,6 +30,7 @@ class CatalogClient:
         Realiza chamada síncrona HTTP GET para obter detalhes e status do jogo.
         """
         url = f"{self.base_url}/games/{game_id}"
+        naming.resolve(self.base_url)
         logger.info(f"Disparando chamada RPC/REST síncrona: GET {url}")
 
         try:
@@ -53,6 +56,7 @@ class CatalogClient:
         Atualiza o status do jogo no catálogo remoto para RENTED ou AVAILABLE.
         """
         url = f"{self.base_url}/games/{game_id}/status"
+        naming.resolve(self.base_url)
         logger.info(f"Disparando chamada RPC/REST síncrona: PATCH {url} com status={new_status}")
 
         try:

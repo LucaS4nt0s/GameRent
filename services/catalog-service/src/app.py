@@ -1,6 +1,5 @@
 import logging
 import os
-import socket
 import threading
 import time
 from datetime import datetime, timezone
@@ -19,8 +18,12 @@ from models import (
     StatusUpdatePayload,
 )
 from geo_utils import calculate_haversine_distance
+import naming
 
-NODE_URN = f"urn:gamerent:node:catalog-service:{os.getenv('INSTANCE_ID') or socket.gethostname()}"
+SERVICE_NAME = "catalog-service"
+NODE_URN = naming.node_urn(SERVICE_NAME)
+# Nomes simbólicos deste nó: Route 53 / Cloud Map na AWS, aliases do Docker DNS localmente
+DNS_TARGETS = [t for t in os.getenv("DNS_DISCOVERY_TARGETS", f"catalog.{naming.INTERNAL_DOMAIN},catalog-service").split(",") if t]
 
 # Configuração de Logs
 logging.basicConfig(
@@ -226,9 +229,23 @@ def health_check():
         "status": "HEALTHY",
         "service": "catalog-service",
         "node_urn": NODE_URN,
+        "instance_id": naming.instance_id(),
         "total_games": len(GAMES_DB),
         "lamport_clock": _lamport_clock
     }
+
+
+@app.get("/discovery", tags=["Monitoramento"])
+def discovery():
+    """Metadados de nomeação do nó: URN, INSTANCE_ID, esquema de URNs e resolução DNS interna."""
+    return naming.discovery_info(SERVICE_NAME, DNS_TARGETS, _lamport_clock)
+
+
+@app.on_event("startup")
+def log_dns_resolution():
+    logger.info(f"Nó {NODE_URN} iniciado")
+    for target in DNS_TARGETS:
+        naming.resolve(target)
 
 
 @app.post("/games", response_model=GamePublicResponse, status_code=status.HTTP_201_CREATED, tags=["Catálogo"])

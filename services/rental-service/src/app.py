@@ -8,6 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from models import RentalCreateRequest, RentalResponse, RentalStatus
 from catalog_client import CatalogClient, CatalogCommunicationError, GameNotFoundError
+import naming
+
+SERVICE_NAME = "rental-service"
+NODE_URN = naming.node_urn(SERVICE_NAME)
 
 # Configuração de Logs
 logging.basicConfig(
@@ -41,10 +45,25 @@ def health_check():
     """Health check do rental-service."""
     return {
         "status": "HEALTHY",
-        "service": "rental-service",
+        "service": SERVICE_NAME,
+        "node_urn": NODE_URN,
+        "instance_id": naming.instance_id(),
         "total_rentals": len(RENTALS_DB),
         "target_catalog_url": catalog_client.base_url
     }
+
+@app.get("/discovery", tags=["Monitoramento"])
+def discovery():
+    """Metadados de nomeação do nó e resolução DNS do catalog-service (nome simbólico -> IP)."""
+    targets = [f"rental.{naming.INTERNAL_DOMAIN}", catalog_client.base_url]
+    return naming.discovery_info(SERVICE_NAME, targets, lamport_clock=None)
+
+
+@app.on_event("startup")
+def log_dns_resolution():
+    logger.info(f"Nó {NODE_URN} iniciado; catálogo em {catalog_client.base_url}")
+    naming.resolve(catalog_client.base_url)
+
 
 @app.post("/rentals", response_model=RentalResponse, status_code=status.HTTP_201_CREATED, tags=["Locações"])
 async def create_rental(payload: RentalCreateRequest):

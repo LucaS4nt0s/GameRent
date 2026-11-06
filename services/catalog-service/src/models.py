@@ -3,6 +3,8 @@ from enum import Enum
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
+import naming
+
 ConsistencyMode = Literal["strong", "eventual"]
 
 
@@ -41,9 +43,9 @@ class _GameBase(BaseModel):
 
     def model_post_init(self, __context) -> None:
         if not self.urn:
-            self.urn = f"urn:gamerent:game:sa-east-1:{self.id}"
+            self.urn = naming.game_urn(self.id)
         if not self.owner_urn:
-            self.owner_urn = f"urn:gamerent:owner:{self.owner_id}"
+            self.owner_urn = naming.owner_urn(self.owner_id)
 
 
 class GamePublicResponse(_GameBase):

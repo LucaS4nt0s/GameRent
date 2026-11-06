@@ -3,6 +3,8 @@ from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field
 
+import naming
+
 class RentalStatus(str, Enum):
     CONFIRMED = "CONFIRMED"
     CANCELLED = "CANCELLED"
@@ -25,3 +27,14 @@ class RentalResponse(BaseModel):
     total_price: float
     status: RentalStatus
     created_at: str
+    urn: str = ""
+    game_urn: str = ""
+    served_by_node: str = ""
+
+    def model_post_init(self, __context) -> None:
+        if not self.urn:
+            self.urn = naming.rental_urn(self.rental_id)
+        if not self.game_urn:
+            self.game_urn = naming.game_urn(self.game_id)
+        if not self.served_by_node:
+            self.served_by_node = naming.node_urn("rental-service")
