@@ -3,7 +3,7 @@
 #
 # Permissões concedidas (infra/iam/gamerent-ec2-policy.json):
 #   - dynamodb:*          nas tabelas gamerent_* em sa-east-1 (+ ListTables)
-#   - route53:*           zona privada gamerent.internal
+#   - route53:*           Route 53 (hoje em "*"; restringir ao ARN da zona gamerent.internal após criá-la)
 #   - servicediscovery:*  AWS Cloud Map
 #
 # Uso (rodar da sua máquina, com AWS CLI configurado com um usuário administrador):
@@ -43,9 +43,12 @@ aws iam put-role-policy \
 echo "==> Instance Profile $PROFILE_NAME"
 if ! aws iam get-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/null 2>&1; then
   aws iam create-instance-profile --instance-profile-name "$PROFILE_NAME" >/dev/null
+fi
+# Checado à parte: uma execução anterior pode ter criado o profile e falhado antes de anexar a role
+ROLES="$(aws iam get-instance-profile --instance-profile-name "$PROFILE_NAME" \
+  --query 'InstanceProfile.Roles[].RoleName' --output text)"
+if [[ " $ROLES " != *" $ROLE_NAME "* ]]; then
   aws iam add-role-to-instance-profile --instance-profile-name "$PROFILE_NAME" --role-name "$ROLE_NAME"
-  # A propagação do Instance Profile no IAM leva alguns segundos
-  sleep 10
 fi
 
 echo "==> Anexando à instância $INSTANCE_ID ($REGION)"
@@ -55,16 +58,35 @@ CURRENT="$(aws ec2 describe-iam-instance-profile-associations \
   --query 'IamInstanceProfileAssociations[0].AssociationId' --output text)"
 
 if [[ "$CURRENT" == "None" || -z "$CURRENT" ]]; then
-  aws ec2 associate-iam-instance-profile \
-    --region "$REGION" \
-    --instance-id "$INSTANCE_ID" \
-    --iam-instance-profile "Name=$PROFILE_NAME" >/dev/null
+  # O Instance Profile recém-criado leva alguns segundos para propagar no IAM
+  for attempt in 1 2 3 4 5 6; do
+    if aws ec2 associate-iam-instance-profile \
+      --region "$REGION" \
+      --instance-id "$INSTANCE_ID" \
+      --iam-instance-profile "Name=$PROFILE_NAME" >/dev/null; then
+      break
+    fi
+    if [[ $attempt == 6 ]]; then
+      echo "Falha ao associar $PROFILE_NAME à instância $INSTANCE_ID" >&2
+      exit 1
+    fi
+    sleep 10
+  done
 else
   aws ec2 replace-iam-instance-profile-association \
     --region "$REGION" \
     --association-id "$CURRENT" \
     --iam-instance-profile "Name=$PROFILE_NAME" >/dev/null
 fi
+
+# Os containers ficam a 2 saltos do IMDS. Com IMDSv2 e hop limit 1, o boto3 dentro do container não
+# recebe o token e fica sem as credenciais da role.
+echo "==> IMDSv2 com hop limit 2 (credenciais acessíveis de dentro dos containers)"
+aws ec2 modify-instance-metadata-options \
+  --region "$REGION" \
+  --instance-id "$INSTANCE_ID" \
+  --http-tokens required \
+  --http-put-response-hop-limit 2 >/dev/null
 
 cat <<EOF
 

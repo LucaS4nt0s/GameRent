@@ -170,7 +170,9 @@ def _get_ddb_table():
         _ddb_table = table
         return _ddb_table
     except Exception as exc:
-        logger.warning(f"DynamoDB indisponível, operando com GAMES_DB em memória: {exc}")
+        # Com USE_DYNAMODB=true (AWS) cair para memória quebra o estado compartilhado entre réplicas
+        log = logger.error if os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") else logger.warning
+        log(f"DynamoDB indisponível, operando com GAMES_DB em memória: {exc}")
         return None
 
 

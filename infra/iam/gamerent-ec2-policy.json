@@ -13,7 +13,7 @@
     {
       "Sid": "DynamoDBListTables",
       "Effect": "Allow",
-      "Action": ["dynamodb:ListTables", "dynamodb:DescribeLimits"],
+      "Action": "dynamodb:ListTables",
       "Resource": "*"
     },
     {
@@ -29,9 +29,9 @@
       "Resource": "*"
     },
     {
-      "Sid": "VpcLeituraParaZonaPrivada",
+      "Sid": "LeituraEc2ParaSetupRoute53",
       "Effect": "Allow",
-      "Action": ["ec2:DescribeVpcs", "ec2:DescribeRegions", "ec2:DescribeInstances"],
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeVpcs", "ec2:DescribeVpcAttribute"],
       "Resource": "*"
     }
   ]

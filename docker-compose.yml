@@ -21,7 +21,8 @@ services:
     # -sharedDb: todas as réplicas enxergam o mesmo banco, independente de região/credencial
     command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
     ports:
-      - "8000:8000"
+      # Só na máquina local: o DynamoDB Local não tem autenticação
+      - "127.0.0.1:8000:8000"
     networks:
       - gamerent-net
     restart: unless-stopped
@@ -45,7 +46,9 @@ services:
     restart: unless-stopped
 
   # Réplica 2 do catálogo (porta 8003) — mesma imagem, mesmo banco, outro INSTANCE_ID.
-  # O alias "catalog-service" faz o Docker DNS devolver os IPs das duas réplicas (round-robin).
+  # Ainda NÃO entra no balanceamento do rental-service: PATCH /status e a geração de IDs usam o
+  # GAMES_DB em memória de cada réplica até a exclusão mútua no DynamoDB (#4/#7). Até lá ela serve
+  # para demonstrar leituras do estado compartilhado (http://localhost:8003).
   catalog-service-2:
     image: gamerent/catalog-service:local
     container_name: gamerent-catalog-2
@@ -58,9 +61,7 @@ services:
       - dynamodb-local
       - catalog-service
     networks:
-      gamerent-net:
-        aliases:
-          - catalog-service
+      - gamerent-net
     restart: unless-stopped
 
   rental-service:

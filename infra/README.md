@@ -9,7 +9,7 @@ python scripts/test_issue_3.py
 
 | Serviço             | Porta host | Papel                                                           |
 |---------------------|-----------:|-----------------------------------------------------------------|
-| `dynamodb-local`    |       8000 | Amazon DynamoDB em container (`-sharedDb -inMemory`)            |
+| `dynamodb-local`    |       8000 | Amazon DynamoDB em container (`-sharedDb -inMemory`), só em 127.0.0.1 |
 | `catalog-service`   |       8001 | Réplica 1 do catálogo (`INSTANCE_ID=catalog-1`)                 |
 | `catalog-service-2` |       8003 | Réplica 2 do catálogo (`INSTANCE_ID=catalog-2`), mesma tabela   |
 | `rental-service`    |       8002 | Orquestrador de locações                                        |
@@ -18,9 +18,12 @@ python scripts/test_issue_3.py
 Variáveis de ambiente injetadas nos serviços: `AWS_REGION=sa-east-1`, `DYNAMODB_ENDPOINT_URL`,
 `INSTANCE_ID`, `GAMES_TABLE_NAME`, `RENTALS_TABLE_NAME`.
 
-As duas réplicas compartilham o alias `catalog-service` na rede `gamerent-net`, então o Docker DNS
-devolve os dois IPs e o `rental-service` alcança qualquer uma delas. Na AWS o nome simbólico
-`catalog.gamerent.internal` vem do Route 53 (issue #5), não do Docker.
+O `rental-service` fala só com a réplica 1 (`catalog-service`). A réplica 2 lê a mesma tabela, mas
+ainda não entra no balanceamento: `PATCH /status` e a geração de IDs usam o estado em memória de cada
+réplica até a exclusão mútua no DynamoDB (#4/#7). Depois disso, basta dar à réplica 2 o alias
+`catalog-service` para o Docker DNS distribuir as chamadas entre as duas.
+
+Na AWS, o nome simbólico `catalog.gamerent.internal` vem do Route 53 (issue #5), não do Docker.
 
 > O `dynamodb-local` roda em memória: os dados somem ao recriar o container.
 
