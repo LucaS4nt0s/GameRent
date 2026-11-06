@@ -14,7 +14,9 @@
 
 > **Status deste documento:** rascunho estrutural. Os trechos marcados com **[EVIDÊNCIA PENDENTE]**
 > devem receber prints do console AWS e a saída de `scripts/test_entrega3.py` (issue #10) antes da
-> exportação para PDF (ver seção 9).
+> exportação para PDF (ver seção 9). Partes da arquitetura descrita ainda estão em PRs abertos:
+> infraestrutura (#25), nomeação (#26), reserva atômica e liberação (#21), Lamport no `rental-service`
+> (issue #6). Revise o texto depois do merge de cada um.
 
 ---
 
@@ -80,8 +82,9 @@ A Entrega 3 ataca três blocos do conteúdo da disciplina:
 ### 2.2. Infraestrutura (issue #3)
 
 - **Local:** `docker compose up -d --build` sobe o DynamoDB Local (`-sharedDb`), as duas réplicas do
-  catálogo apontando para a mesma tabela, o `rental-service` e o front-end. As réplicas compartilham o
-  alias `catalog-service`, e o Docker DNS devolve os IPs de ambas.
+  catálogo apontando para a mesma tabela, o `rental-service` e o front-end. Por enquanto o
+  `rental-service` fala só com a réplica 1. A réplica 2 entra no balanceamento quando a escrita de
+  status e a geração de IDs passarem a ser feitas no DynamoDB (#4/#7).
 - **AWS:** a EC2 recebe a IAM Role `GameRentEC2Role` (`infra/setup_iam.sh`) com `dynamodb:*` nas tabelas
   `gamerent_*`, `route53:*` e `servicediscovery:*`. Nenhuma chave de acesso fica na máquina: o boto3 usa as
   credenciais temporárias do Instance Profile. O override `docker-compose.aws.yml` desliga o endpoint
@@ -113,7 +116,7 @@ O GameRent usa a última. O DynamoDB funciona como árbitro: a operação `Updat
 `ConditionExpression` é atômica por item, então a verificação ("está `AVAILABLE`?") e a ação ("vire
 `RENTED`") acontecem num único passo indivisível no servidor.
 
-### 3.2. Exclusão mútua (issues #7 e #9)
+### 3.2. Exclusão mútua (issues #7, #9 e #14 — PR #21)
 
 ```text
 UpdateItem gamerent_games
@@ -129,6 +132,10 @@ UpdateItem gamerent_games
   o 409 ao cliente.
 - A devolução faz a operação inversa (`RENTED → AVAILABLE`, limpando `current_rental_id`).
 
+> **Estado atual:** o endpoint atômico de reserva e liberação está no PR #21, ainda não mergeado. Em
+> `dev`, o fluxo continua sendo `GET` + `PATCH /status`, com `put_item` incondicional. A ausência de
+> *double-booking* só pode ser afirmada depois do CA-02 (seção 3.4).
+
 ### 3.3. Relógio lógico de Lamport (issue #6)
 
 Cada nó mantém um contador `L`:
@@ -137,8 +144,11 @@ Cada nó mantém um contador `L`:
 - recebimento: `L = max(L, L_msg) + 1`, devolvido no header de resposta e no JSON (`lamport_clock`).
 
 Assim, se a reserva *a* causou a atualização *b* no catálogo, então `L(a) < L(b)` (relação
-*happens-before*). Os logs registram `[LAMPORT=n]` junto do horário físico UTC, o que permite
-reconstruir a ordem causal das operações entre os nós.
+*happens-before*). A recíproca não vale: `L(a) < L(b)` não prova que *a* causou *b*, porque eventos
+concorrentes também recebem valores ordenados. Ordenando por `(L, id do nó)`, os nós obtêm uma **ordem
+total consistente com a causalidade**, suficiente para registrar e auditar as operações. Detectar
+concorrência exigiria relógios vetoriais. Os logs registram `[LAMPORT=n]` junto do horário físico
+(`asctime` do container, que fica em UTC por padrão nas imagens `python:3.11-slim`).
 
 ### 3.4. Evidências
 
@@ -186,6 +196,12 @@ tem probabilidade de colisão desprezível. Os URNs aparecem em `/health`, `/dis
 | Docker   | `catalog-service`                | DNS embutido do Docker (rede `gamerent-net`)   |
 | AWS      | `catalog.gamerent.internal`      | Route 53 Private Hosted Zone `gamerent.internal` |
 
+Uma zona privada só responde dentro das VPCs associadas a ela, e a VPC precisa ter `enableDnsSupport`
+e `enableDnsHostnames` ligados (o script verifica isso). O AWS Cloud Map é uma alternativa: um namespace
+DNS privado do Cloud Map cria a mesma zona no Route 53 e permite registrar e remover instâncias por API,
+com health check. Com uma única EC2, a zona privada direta é suficiente. Por isso a IAM Role já tem
+`servicediscovery:*`, mas o Cloud Map não foi usado.
+
 `infra/setup_route53.sh` cria a zona privada associada à VPC e publica `catalog.gamerent.internal` e
 `rental.gamerent.internal` (registros A, TTL 60 s) com o IP privado da EC2. Os serviços registram cada
 tradução feita com `socket.getaddrinfo`:
@@ -212,8 +228,16 @@ o esquema de URNs e a resolução de cada nome simbólico.
 ### 5.1. Fundamentação
 
 Replicar dados aumenta a disponibilidade e a tolerância a falhas, mas cria a questão de **quando** uma
-escrita fica visível nas outras réplicas. O teorema CAP e, de forma mais prática, o PACELC dizem que,
-mesmo sem partição, há um compromisso entre **latência** e **consistência**.
+escrita fica visível nas outras réplicas.
+
+- O **teorema CAP** trata do caso com **partição** de rede: o sistema precisa escolher entre
+  consistência e disponibilidade.
+- O **PACELC** completa o CAP com o caso normal (*Else*): **sem** partição, ainda há um compromisso
+  entre **latência** e **consistência**.
+
+Pelo PACELC, o DynamoDB fica em PA/EL por padrão (leitura eventual, mais barata e rápida). Quando o
+cliente pede `ConsistentRead`, aquela leitura vai para PC/EC: paga latência para ver a última escrita
+confirmada.
 
 - **Consistência forte:** toda leitura vê a escrita mais recente já confirmada (linearizável por item).
 - **Consistência eventual:** sem novas escritas, todas as réplicas convergem. Até lá, uma leitura pode
@@ -221,13 +245,18 @@ mesmo sem partição, há um compromisso entre **latência** e **consistência**
 
 ### 5.2. Replicação no DynamoDB
 
-Cada tabela do DynamoDB é replicada automaticamente em três zonas de disponibilidade da região. A
-escrita é confirmada depois de persistida na maioria das réplicas. Na leitura, o cliente escolhe:
+O DynamoDB replica cada tabela automaticamente em múltiplas zonas de disponibilidade da região (AWS,
+*Developer Guide*). Internamente, cada partição tem um grupo de réplicas com um líder, e a escrita é
+confirmada depois de gravada num quórum delas (ELHEMALI et al., USENIX ATC 2022). Na leitura, o
+cliente escolhe:
 
 | Parâmetro do GameRent   | Chamada no DynamoDB      | Garantia                      | Custo                       |
 |-------------------------|--------------------------|-------------------------------|-----------------------------|
-| `consistency=strong`    | `ConsistentRead=True`    | Lê a última escrita confirmada | 1 RCU / 4 KB, mais latência |
-| `consistency=eventual`  | `ConsistentRead=False`   | Pode ler dado antigo          | ½ RCU / 4 KB, menos latência |
+| `consistency=strong`    | `ConsistentRead=True`    | Lê a última escrita confirmada | 1 unidade de leitura / 4 KB, mais latência |
+| `consistency=eventual`  | `ConsistentRead=False`   | Pode ler dado antigo          | ½ unidade de leitura / 4 KB, menos latência |
+
+No modo provisionado a unidade é a RCU; no on-demand, a RRU. Num `Scan` (usado por `GET /games`), o
+custo é calculado sobre o volume total lido, não por item retornado.
 
 No nível da aplicação, as duas réplicas do `catalog-service` não guardam estado próprio: elas são
 réplicas de processamento sobre o mesmo armazenamento replicado. Por isso um jogo cadastrado em
@@ -261,8 +290,10 @@ distribuídos:
 - **Cards de jogos:** URN do jogo (`urn:gamerent:game:sa-east-1:{id}`), `lamport_clock` da última
   escrita (`L=n`) e versão (`v{n}`).
 - **Status de bloqueio em tempo real:** jogos `RENTED` aparecem acinzentados com o aviso "Bloqueado pela
-  locação …". A interface relê catálogo, locações e saúde a cada 3 s em segundo plano. Uma reserva ou
-  devolução feita por outro cliente, ou em outra réplica, aparece sem recarregar a página.
+  locação …". A interface relê catálogo, locações e saúde em segundo plano: cada ciclo começa 3 s depois
+  do anterior terminar, e uma resposta atrasada nunca sobrescreve uma mais nova. Uma reserva ou devolução
+  feita por outro cliente aparece sem recarregar a página. Se o jogo for bloqueado enquanto o formulário
+  de aluguel está aberto, o botão de confirmar é desativado.
 - **Pedidos:** cada locação mostra seu URN `urn:gamerent:rental:{uuid}`.
 
 > **[EVIDÊNCIA PENDENTE]** Print da interface com um jogo bloqueado e a faixa do nó visível.
@@ -284,10 +315,11 @@ distribuídos:
 
 ## 8. Conclusão
 
-A Entrega 3 tirou o GameRent de um protótipo com estado em memória e trouxe uma arquitetura em que:
+A Entrega 3 leva o GameRent de um protótipo com estado em memória para uma arquitetura em que (sujeito
+à validação dos critérios de aceite nas seções de evidências):
 
 - várias réplicas do catálogo operam sobre um armazenamento replicado e compartilhado;
-- a reserva de um exemplar é decidida por uma escrita condicional atômica, sem *double-booking*;
+- a reserva de um exemplar é decidida por uma escrita condicional atômica, para evitar *double-booking*;
 - a ordem causal entre os serviços fica registrada por relógios de Lamport;
 - recursos e nós têm nomes formais e estáveis, e os serviços se encontram por DNS, não por IP fixo;
 - o cliente escolhe entre consistência forte e eventual, conhecendo o custo em latência de cada uma.
@@ -313,5 +345,9 @@ pandoc docs/relatorio-entrega-3.md -s -o docs/relatorio-entrega-3.html --metadat
   6 (Coordenação) e 7 (Consistência e Replicação).
 - LAMPORT, L. Time, Clocks, and the Ordering of Events in a Distributed System. *Communications of the
   ACM*, 21(7), 1978.
-- AWS. *Amazon DynamoDB Developer Guide* — Read consistency; Condition expressions.
+- AWS. *Amazon DynamoDB Developer Guide* — Read consistency; Condition expressions; Read/write capacity mode.
+- ELHEMALI, M. et al. Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL
+  Database Service. *USENIX ATC*, 2022.
+- ABADI, D. Consistency Tradeoffs in Modern Distributed Database System Design (PACELC). *IEEE
+  Computer*, 45(2), 2012.
 - AWS. *Amazon Route 53 Developer Guide* — Working with private hosted zones.

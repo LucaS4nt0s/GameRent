@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './api.js'
 
 const STATUS_LABEL = {
@@ -9,6 +9,7 @@ const STATUS_LABEL = {
 
 // Intervalo do "tempo real": catálogo, locações e relógio de Lamport são relidos em segundo plano
 const POLL_MS = 3000
+const NEARBY_KM = 50
 
 const THUMBS = [
   'linear-gradient(135deg,#00A650,#00D26A)',
@@ -34,7 +35,11 @@ export default function App() {
   const [games, setGames] = useState([])
   const [rentals, setRentals] = useState([])
   const [health, setHealth] = useState({ catalog: null, rental: null })
+  // urn: réplica que serviu o catálogo; lamport: relógio da réplica que respondeu o /health
   const [node, setNode] = useState({ urn: '', lamport: null, updatedAt: null })
+  // Número de sequência por recurso: só a resposta da requisição mais recente é aplicada,
+  // então um poll lento não sobrescreve o resultado de um "Alugar"/"Devolver" mais novo
+  const seq = useRef({ games: 0, rentals: 0, nearby: 0 })
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const [loading, setLoading] = useState(false)
@@ -80,7 +85,7 @@ export default function App() {
     try {
       const data = await api.catalog.health()
       setHealth((h) => ({ ...h, catalog: data.status }))
-      setNode({ urn: data.node_urn || '', lamport: data.lamport_clock ?? null, updatedAt: new Date() })
+      setNode((n) => ({ ...n, lamport: data.lamport_clock ?? null }))
     } catch {
       setHealth((h) => ({ ...h, catalog: 'DOWN' }))
     }
@@ -92,14 +97,25 @@ export default function App() {
     }
   }
 
+  // Busca e aplica só se ainda for a requisição mais recente daquele recurso
+  async function fetchLatest(key, fetcher, apply) {
+    const mine = ++seq.current[key]
+    const data = await fetcher()
+    if (data && mine === seq.current[key]) apply(data)
+    return data
+  }
+
+  function applyGames(data) {
+    setGames(data)
+    setNode((n) => ({ ...n, urn: data[0]?.served_by_node || n.urn, updatedAt: new Date() }))
+  }
+
   async function loadGames() {
-    const data = await run(() => api.catalog.listGames())
-    if (data) setGames(data)
+    await fetchLatest('games', () => run(() => api.catalog.listGames()), applyGames)
   }
 
   async function loadRentals() {
-    const data = await run(() => api.rental.listRentals())
-    if (data) setRentals(data)
+    await fetchLatest('rentals', () => run(() => api.rental.listRentals()), setRentals)
   }
 
   useEffect(() => {
@@ -110,21 +126,32 @@ export default function App() {
   }, [])
 
   // Atualização silenciosa (sem "Carregando…"): status de bloqueio, versão e Lamport mudam ao vivo
+  // Próximo ciclo só começa depois que o anterior terminar (sem requisições sobrepostas).
   useEffect(() => {
-    const id = setInterval(async () => {
-      if (document.hidden) return
-      loadHealth()
-      try {
-        setGames(await api.catalog.listGames())
-        setRentals(await api.rental.listRentals())
-        if (coords) setNearby(await api.catalog.nearby(coords.lat, coords.lon, 50))
-      } catch {
-        // falhas transitórias aparecem no indicador de saúde do topo
+    let stopped = false
+    let timer
+    async function tick() {
+      if (!document.hidden) {
+        // allSettled: uma falha (ex.: /games 500) não impede as outras atualizações;
+        // o "ao vivo · hh:mm:ss" só avança quando o catálogo realmente atualiza
+        await Promise.allSettled([
+          loadHealth(),
+          fetchLatest('games', () => api.catalog.listGames(), applyGames),
+          fetchLatest('rentals', () => api.rental.listRentals(), setRentals),
+          coords && tab === 'nearby'
+            ? fetchLatest('nearby', () => api.catalog.nearby(coords.lat, coords.lon, NEARBY_KM), setNearby)
+            : null,
+        ])
       }
-    }, POLL_MS)
-    return () => clearInterval(id)
+      if (!stopped) timer = setTimeout(tick, POLL_MS)
+    }
+    timer = setTimeout(tick, POLL_MS)
+    return () => {
+      stopped = true
+      clearTimeout(timer)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [coords])
+  }, [coords, tab])
 
   function openRent(game) {
     setRenting(game)
@@ -172,10 +199,9 @@ export default function App() {
       async (pos) => {
         const lat = pos.coords.latitude
         const lon = pos.coords.longitude
-        const data = await run(() => api.catalog.nearby(lat, lon, 50))
+        const data = await fetchLatest('nearby', () => run(() => api.catalog.nearby(lat, lon, NEARBY_KM)), setNearby)
         if (data) {
           setCoords({ lat, lon })
-          setNearby(data)
           setTab('nearby')
         }
         setLocating(false)
@@ -188,6 +214,9 @@ export default function App() {
   }
 
   const serviceUp = health.catalog === 'HEALTHY' && health.rental === 'HEALTHY'
+  // O sheet guarda um snapshot; o polling avisa se outro cliente bloqueou o jogo enquanto ele está aberto
+  const rentingLive = renting && games.find((g) => g.id === renting.id)
+  const rentingLocked = Boolean(rentingLive && rentingLive.status !== 'AVAILABLE')
 
   return (
     <div className="app">
@@ -210,8 +239,8 @@ export default function App() {
           <span className={`pulse ${serviceUp ? 'ok' : 'down'}`} title={serviceUp ? 'Serviços online' : 'Serviço indisponível'} />
         </div>
         <div className="node-strip">
-          <span className="mono" title="Nó do catálogo que respondeu">{node.urn || 'nó desconhecido'}</span>
-          <span className="lamport" title="Relógio lógico de Lamport do nó">Lamport {node.lamport ?? '–'}</span>
+          <span className="mono" title="Réplica do catálogo que serviu a última listagem (served_by_node)">{node.urn || 'nó desconhecido'}</span>
+          <span className="lamport" title="Relógio de Lamport da réplica que respondeu o /health (cada réplica tem o seu)">Lamport do nó {node.lamport ?? '–'}</span>
           {node.updatedAt && <span className="live">ao vivo · {node.updatedAt.toLocaleTimeString('pt-BR')}</span>}
         </div>
       </header>
@@ -270,7 +299,7 @@ export default function App() {
                 nearby.map((g, i) => (
                   <GameCard key={g.id} game={g} thumb={THUMBS[i % THUMBS.length]} onRent={openRent} distance={g.distance_km} />
                 ))}
-              {nearby && nearby.length === 0 && <p className="empty">Nenhum jogo num raio de 50 km.</p>}
+              {nearby && nearby.length === 0 && <p className="empty">Nenhum jogo num raio de {NEARBY_KM} km.</p>}
               {!nearby && <p className="empty">Toque em "Usar minha localização" para ver jogos por perto.</p>}
             </div>
           </>
@@ -359,7 +388,8 @@ export default function App() {
                 Total estimado
                 <strong>R$ {(renting.price_per_day * Number(form.rental_days || 0)).toFixed(2)}</strong>
               </div>
-              <button className="cta wide" type="submit">Confirmar aluguel</button>
+              {rentingLocked && <p className="lock-note">Este jogo acabou de ser bloqueado por outra locação.</p>}
+              <button className="cta wide" type="submit" disabled={rentingLocked}>Confirmar aluguel</button>
               <button className="ghost wide" type="button" onClick={() => setRenting(null)}>Cancelar</button>
             </form>
           </div>
@@ -387,7 +417,7 @@ function GameCard({ game, thumb, onRent, distance }) {
         <div className="dist-meta">
           {game.urn && <span className="mono urn" title="URN do jogo">{game.urn}</span>}
           <span className="lamport" title="Relógio de Lamport da última escrita">L={game.lamport_clock ?? '–'}</span>
-          <span title="Versão do item">v{game.version ?? 1}</span>
+          <span title="Versão do item">v{game.version ?? '–'}</span>
         </div>
         {game.status === 'RENTED' && (
           <p className="lock-note">

@@ -66,6 +66,8 @@ docs/relatorio-entrega-2.md
 relatorio-entrega-*.md
 # Exceção: o relatório da Entrega 3 é versionado em Markdown (issue #11)
 !docs/relatorio-entrega-3.md
+# HTML intermediário gerado pelo pandoc para exportar o PDF
+docs/*.html
 docs/diagrams/*
 !docs/diagrams/.gitkeep
 docs/*.png
