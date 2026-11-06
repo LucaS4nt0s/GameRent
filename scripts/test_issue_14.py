@@ -90,7 +90,7 @@ def main():
 
         # 2. Teste Direto: POST /games/{id}/reserve (Catalog)
         print("\n[2/7] Testando Reserva Atomica direta no Catalog (POST /games/2/reserve)...")
-        req(f"{CATALOG_URL}/games/2/release", method="POST")
+        req(f"{CATALOG_URL}/games/2/release?force=true", method="POST")
         s_res, g_res, h_res = req(
             f"{CATALOG_URL}/games/2/reserve",
             method="POST",
@@ -104,27 +104,55 @@ def main():
         assert clock_returned > 5, f"Lamport clock ({clock_returned}) nao avancou alem de 5"
         print(f"  [OK] Reserva atomica no catalogo funcionou! URN={g_res['urn']}, Status={g_res['status']}, Lamport={clock_returned}")
 
-        # 3. Teste Direto de Conflito: Repetir reserva no jogo 2 (Double-Booking no Catalogo)
+        # 2.1 Teste de Idempotencia: Repetir a mesma reserva (mesmo rental_id) deve responder 200 OK
+        s_idem, g_idem, _ = req(
+            f"{CATALOG_URL}/games/2/reserve",
+            method="POST",
+            body={"rental_id": "test-uuid-002", "renter_name": "KauaN Tester"}
+        )
+        assert s_idem == 200, f"Esperado 200 em retentativa idempotente, obtido {s_idem}: {g_idem}"
+        print("  [OK] Retentativa de reserva idempotente confirmada com 200 OK.")
+
+        # 3. Teste Direto de Conflito: Repetir reserva no jogo 2 para OUTRO rental_id
         print("\n[3/7] Testando Prevencao de Conflito 409 no Catalogo...")
         s_dup, g_dup, _ = req(
             f"{CATALOG_URL}/games/2/reserve",
             method="POST",
             body={"rental_id": "test-uuid-dup", "renter_name": "Outro Locatario"}
         )
-        assert s_dup == 409, f"Esperado 409 ao tentar reservar jogo ja RENTED, obtido {s_dup}"
+        assert s_dup == 409, f"Esperado 409 ao tentar reservar jogo ja RENTED por outro, obtido {s_dup}"
         print(f"  [OK] Conflito 409 bloqueado com sucesso pelo catalogo: {g_dup.get('detail')}")
 
-        # 4. Teste Direto: POST /games/{id}/release (Catalog)
-        print("\n[4/7] Testando Liberacao Atomica direta no Catalog (POST /games/2/release)...")
-        s_rel, g_rel, _ = req(f"{CATALOG_URL}/games/2/release", method="POST")
-        assert s_rel == 200, f"Esperado 200 ao liberar jogo, obtido {s_rel}"
+        # 4. Teste de Seguranca e Liberacao Atomica: POST /games/{id}/release (Catalog)
+        print("\n[4/7] Testando Seguranca e Liberacao Atomica no Catalog (POST /games/2/release)...")
+        # 4.1 Tentativa de liberacao sem rental_id deve ser bloqueada com 409
+        s_unauth, g_unauth, _ = req(f"{CATALOG_URL}/games/2/release", method="POST")
+        assert s_unauth == 409, f"Esperado 409 ao tentar liberar jogo alugado sem rental_id, obtido {s_unauth}"
+        print(f"  [OK] Tentativa de liberacao sem rental_id bloqueada com 409: {g_unauth.get('detail')}")
+
+        # 4.2 Tentativa de liberacao com rental_id incorreto deve ser bloqueada com 409
+        s_wrong, g_wrong, _ = req(
+            f"{CATALOG_URL}/games/2/release",
+            method="POST",
+            body={"rental_id": "wrong-rental-uuid"}
+        )
+        assert s_wrong == 409, f"Esperado 409 ao tentar liberar jogo com rental_id invalido, obtido {s_wrong}"
+        print(f"  [OK] Tentativa com rental_id divergente bloqueada com 409: {g_wrong.get('detail')}")
+
+        # 4.3 Liberacao com rental_id correto deve ter sucesso
+        s_rel, g_rel, _ = req(
+            f"{CATALOG_URL}/games/2/release",
+            method="POST",
+            body={"rental_id": "test-uuid-002"}
+        )
+        assert s_rel == 200, f"Esperado 200 ao liberar jogo com rental_id correto, obtido {s_rel}"
         assert g_rel["status"] == "AVAILABLE", f"Esperado status AVAILABLE, obtido {g_rel['status']}"
         assert g_rel.get("current_rental_id") is None, "current_rental_id nao foi anulado na liberacao"
         print(f"  [OK] Jogo liberado com sucesso: Status={g_rel['status']}, current_rental_id={g_rel.get('current_rental_id')}")
 
         # 5. Fluxo End-to-End: POST /rentals no Rental-Service (Aluguel Atomico Completo)
         print("\n[5/7] Testando Fluxo Integrado S2S (POST /rentals -> POST /games/1/reserve)...")
-        req(f"{CATALOG_URL}/games/1/release", method="POST")
+        req(f"{CATALOG_URL}/games/1/release?force=true", method="POST")
         rental_payload = {
             "renter_name": "KauaN Santos",
             "renter_email": "kauan@gamerent.com",
