@@ -61,8 +61,11 @@ suba o `rental-service` com `CATALOG_SERVICE_URL=http://catalog.gamerent.interna
 
 ## Contrato do `GET /discovery`
 
+O endpoint segue o contrato da issue #16 (`service`, `node_urn`, `instance_id`, `hostname`, `local_ip`,
+`dns_target`, `dns_resolution{target_hostname, resolved_ips, status: RESOLVED|UNRESOLVED}`,
+`lamport_clock`, `dynamodb{connected, table_name, mode}`, `timestamp`), montado a partir do `naming.py`.
+Os campos da issue #5 vêm como acréscimos: `region`, `local_ips`, `internal_domain`, `dns[]` (resolução
+de cada nome simbólico do nó) e `urn_schema`.
+
 Cada resolução tem limite de `DNS_TIMEOUT_S` (padrão 2 s), então um nome inexistente não trava o endpoint
-nem as chamadas S2S. Além dos campos de nomeação (`node_urn`, `urn_schema`, `dns[]`, `local_ips`, `region`),
-a resposta inclui `dns_target`, `dns_resolution{status: RESOLVED|UNRESOLVED}`, `local_ip`,
-`dynamodb{table_name, mode}` e `timestamp`, no mesmo formato do `/discovery` do PR #24 (issue #16). No
-`catalog-service`, consultar o endpoint sincroniza o relógio de Lamport com o header `X-Lamport-Clock`.
+nem as chamadas S2S. Consultar o endpoint sincroniza o relógio de Lamport com o header `X-Lamport-Clock`.

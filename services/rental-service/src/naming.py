@@ -20,7 +20,6 @@ import os
 import re
 import socket
 import uuid
-from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import quote, urlparse
 
@@ -143,34 +142,17 @@ def local_ips() -> list[str]:
         return []
 
 
-def discovery_info(
-    service_name: str,
-    dns_targets: list[str],
-    lamport_clock: Optional[int],
-    dynamodb: Optional[dict] = None,
-) -> dict:
-    """Metadados de nomeação do nó atual, servidos em GET /discovery.
+def naming_extras(dns_targets: list[str]) -> dict:
+    """Campos de nomeação que complementam o contrato do GET /discovery (issue #16).
 
-    Os campos dns_target, dns_resolution, local_ip, dynamodb e timestamp seguem o contrato do
-    /discovery do PR #24 (issue #16), para que os dois PRs convivam no merge.
+    Retorna: region, local_ips, internal_domain, dns (resolução de cada nome simbólico) e
+    urn_schema. dns[0] é o mesmo alvo informado em dns_target/dns_resolution.
     """
-    dns = [resolve(t) for t in dns_targets]
-    ips = local_ips()
     return {
-        "service": service_name,
-        "node_urn": node_urn(service_name),
-        "instance_id": instance_id(),
         "region": region(),
-        "hostname": socket.gethostname(),
-        "local_ip": ips[0] if ips else None,
-        "local_ips": ips,
+        "local_ips": local_ips(),
         "internal_domain": INTERNAL_DOMAIN,
-        "dns_target": dns_targets[0] if dns_targets else None,
-        "dns_resolution": dns[0] if dns else None,
-        "dns": dns,
-        "dynamodb": dynamodb,
-        "lamport_clock": lamport_clock,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "dns": [resolve(t) for t in dns_targets],
         "urn_schema": {
             "node": f"{NAMESPACE}:node:{{service_name}}:{{instance_id}}",
             "game": f"{NAMESPACE}:game:{{region}}:{{game_id}}",
