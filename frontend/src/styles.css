@@ -1198,3 +1198,12 @@ button.danger:disabled {
     align-items: flex-start;
   }
 }
+
+.result-card.result-NETWORK {
+  border-color: #f2c37e;
+  background: #fffaf2;
+}
+
+.result-NETWORK .result-status {
+  color: #a35c00;
+}

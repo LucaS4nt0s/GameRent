@@ -306,22 +306,22 @@ async def create_rental(
     except GameConflictError as exc:
         # Rejeição imediata com 409 Conflict
         logger.warning(f"[LAMPORT={clock}] Reserva rejeitada com 409 Conflict: {exc}")
-        response.headers["X-Lamport-Clock"] = str(clock)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=str(exc)
+            detail=str(exc),
+            headers={"X-Lamport-Clock": str(clock)}
         )
     except GameNotFoundError as exc:
-        response.headers["X-Lamport-Clock"] = str(clock)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(exc)
+            detail=str(exc),
+            headers={"X-Lamport-Clock": str(clock)}
         )
     except CatalogCommunicationError as exc:
-        response.headers["X-Lamport-Clock"] = str(clock)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Falha de comunicação inter-serviços: {exc}"
+            detail=f"Falha de comunicação inter-serviços: {exc}",
+            headers={"X-Lamport-Clock": str(clock)}
         )
 
     # Sincroniza o relógio de Lamport com o relógio retornado pelo catálogo
@@ -362,10 +362,10 @@ async def create_rental(
             )
         except Exception as rollback_err:
             logger.critical(f"Falha catastrófica ao tentar compensar reserva do jogo {payload.game_id}: {rollback_err}")
-        response.headers["X-Lamport-Clock"] = str(clock)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro interno ao registrar locação. A reserva do exemplar foi cancelada: {exc}"
+            detail=f"Erro interno ao registrar locação. A reserva do exemplar foi cancelada: {exc}",
+            headers={"X-Lamport-Clock": str(clock)}
         )
 
     logger.info(f"[LAMPORT={clock}] Aluguel confirmado com sucesso! ID={rental_id}, URN={resp_obj.urn}, Total=R$ {total_price}")

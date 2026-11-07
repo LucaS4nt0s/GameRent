@@ -29,6 +29,9 @@ const DEFAULT_SEARCH = {
   maxKm: '10',
 }
 
+const POLL_MS = 3000
+const DISCOVERY_POLL_MS = 5000
+
 const DEFAULT_OWNER_FORM = {
   title: '',
   description: '',
@@ -85,8 +88,14 @@ export default function App() {
   const [ownerFilter, setOwnerFilter] = useState('')
   const [ownerGames, setOwnerGames] = useState([])
   const [ownerMeta, setOwnerMeta] = useState(null)
+  const [labGames, setLabGames] = useState([])
 
-  const [discovery, setDiscovery] = useState({ catalog: null, rental: null, errors: {} })
+  const [discovery, setDiscovery] = useState({
+    catalog: null,
+    rental: null,
+    errors: {},
+    updatedAt: null,
+  })
   const [loadingDiscovery, setLoadingDiscovery] = useState(false)
 
   const [labGameId, setLabGameId] = useState('')
@@ -97,8 +106,8 @@ export default function App() {
   const [benchmark, setBenchmark] = useState(null)
 
   const availableGames = useMemo(
-    () => nearby.items.filter((game) => game.status === 'AVAILABLE'),
-    [nearby.items]
+    () => labGames.filter((game) => game.status === 'AVAILABLE'),
+    [labGames]
   )
 
   const renterGames = useMemo(() => {
@@ -162,13 +171,21 @@ export default function App() {
     return data
   }
 
+  async function loadLabGames(mode = consistency) {
+    const data = await api.catalog.listGames({ consistency: mode })
+    setLabGames(data.items)
+    return data
+  }
+
   async function refreshCatalog(mode = consistency) {
-    const [near, owner] = await Promise.allSettled([
+    const [near, owner, lab] = await Promise.allSettled([
       loadNearby({ consistency: mode }),
       loadOwnerGames(ownerFilter, mode),
+      loadLabGames(mode),
     ])
     if (near.status === 'rejected') throw near.reason
     if (owner.status === 'rejected') throw owner.reason
+    if (lab.status === 'rejected') throw lab.reason
   }
 
   useEffect(() => {
@@ -191,6 +208,7 @@ export default function App() {
         setRentals(rentalsData.items)
         setOwnerGames(ownerData.items)
         setOwnerMeta(ownerData.meta)
+        setLabGames(ownerData.items)
       } catch (err) {
         if (active) setError(err.message)
       } finally {
@@ -205,6 +223,54 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  useEffect(() => {
+    let stopped = false
+    let timer
+    async function tick() {
+      if (!document.hidden) {
+        await Promise.allSettled([
+          loadHealth(),
+          api.catalog
+            .nearby({ ...search, consistency })
+            .then((data) => setNearby(data)),
+          api.rental
+            .listRentals({ renterEmail: renterEmailFilter.trim() || undefined })
+            .then((data) => setRentals(data.items)),
+          api.catalog
+            .listGames({ consistency, ownerId: ownerFilter.trim() || undefined })
+            .then((data) => {
+              setOwnerGames(data.items)
+              setOwnerMeta(data.meta)
+            }),
+          api.catalog.listGames({ consistency }).then((data) => setLabGames(data.items)),
+        ])
+      }
+      if (!stopped) timer = setTimeout(tick, POLL_MS)
+    }
+    timer = setTimeout(tick, POLL_MS)
+    return () => {
+      stopped = true
+      clearTimeout(timer)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search.lat, search.lon, search.maxKm, consistency, renterEmailFilter, ownerFilter])
+
+  useEffect(() => {
+    if (tab !== 'lab') return undefined
+    let stopped = false
+    let timer
+    async function tick() {
+      await refreshDiscovery(true)
+      if (!stopped) timer = setTimeout(tick, DISCOVERY_POLL_MS)
+    }
+    tick()
+    return () => {
+      stopped = true
+      clearTimeout(timer)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab])
+
   async function searchNearby(coords) {
     const next = coords
       ? {
@@ -217,6 +283,14 @@ export default function App() {
     await run(async () => {
       await loadNearby({ ...next, consistency })
       setMessage(`Busca concluída com consistência ${modeLabel(consistency)}.`)
+    })
+  }
+
+  async function changeConsistency(mode) {
+    setConsistency(mode)
+    await run(async () => {
+      await loadNearby({ consistency: mode })
+      setMessage(`Busca atualizada com consistência ${modeLabel(mode)}.`)
     })
   }
 
@@ -276,7 +350,10 @@ export default function App() {
     const data = await run(() => api.rental.returnRental(id))
     if (!data) return
     const success = `Devolução registrada. Jogo liberado no catálogo (Lamport ${data.lamport_clock}).`
-    await run(refreshCatalog)
+    await run(async () => {
+      await refreshCatalog()
+      await loadRentals()
+    })
     setMessage(success)
   }
 
@@ -303,8 +380,7 @@ export default function App() {
       longitude: current.longitude,
     }))
     await run(async () => {
-      await loadOwnerGames()
-      await loadNearby()
+      await refreshCatalog()
       setLabGameId(String(data.id))
     })
     setMessage(success)
@@ -319,16 +395,15 @@ export default function App() {
     const data = await run(() => api.catalog.updateStatus(game.id, nextStatus))
     if (!data) return
     const success = `Status de "${data.title}" alterado para ${STATUS_LABEL[data.status]} (v${data.version}).`
-    await run(async () => {
-      await loadOwnerGames()
-      await loadNearby()
-    })
+    await run(refreshCatalog)
     setMessage(success)
   }
 
-  async function refreshDiscovery() {
-    setLoadingDiscovery(true)
-    setError('')
+  async function refreshDiscovery(silent = false) {
+    if (!silent) {
+      setLoadingDiscovery(true)
+      setError('')
+    }
     const errors = {}
     const [catalog, rental] = await Promise.allSettled([
       api.catalog.discovery(),
@@ -340,12 +415,13 @@ export default function App() {
       catalog: catalog.status === 'fulfilled' ? catalog.value : null,
       rental: rental.status === 'fulfilled' ? rental.value : null,
       errors,
+      updatedAt: new Date(),
     })
-    setLoadingDiscovery(false)
+    if (!silent) setLoadingDiscovery(false)
   }
 
   async function runDoubleBooking() {
-    const selected = nearby.items.find((game) => String(game.id) === String(labGameId))
+    const selected = labGames.find((game) => String(game.id) === String(labGameId))
     const game = selected && selected.status === 'AVAILABLE' ? selected : availableGames[0]
     if (!game) {
       setError('Nenhum jogo disponível para simular. Cadastre ou devolva um jogo primeiro.')
@@ -367,7 +443,18 @@ export default function App() {
           rental_days: 1,
         })
       )
-      const responses = await Promise.all(requests)
+      const settled = await Promise.allSettled(requests)
+      const responses = settled.map((result) =>
+        result.status === 'fulfilled'
+          ? result.value
+          : {
+              ok: false,
+              status: 'NETWORK',
+              body: null,
+              error: result.reason?.message || 'Falha de rede',
+              meta: null,
+            }
+      )
       setSimResults(
         responses.map((response, index) => ({
           index: index + 1,
@@ -375,9 +462,11 @@ export default function App() {
           ...response,
         }))
       )
+      await run(async () => {
+        await refreshCatalog()
+        await loadRentals()
+      })
       setMessage(`Simulação concluída para "${game.title}".`)
-      await loadNearby()
-      await loadRentals()
     } catch (err) {
       setError(err.message)
     } finally {
@@ -390,30 +479,41 @@ export default function App() {
     setError('')
     setMessage('')
     try {
-      async function sample(mode) {
-        const runs = []
-        for (let index = 0; index < 5; index += 1) {
-          const startedAt = performance.now()
-          const data = await api.catalog.listGames({ consistency: mode })
-          const elapsed = performance.now() - startedAt
-          runs.push({
-            latency: data.meta.db_read_latency_ms ?? elapsed,
-            served_by_node: data.meta.served_by_node,
-            games: data.items.length,
-          })
-        }
-        const total = runs.reduce((sum, item) => sum + item.latency, 0)
+      const runs = { strong: [], eventual: [] }
+      let source = 'db_read_latency_ms'
+
+      const warmup = await api.catalog.listGames({ consistency: 'eventual' })
+      if (warmup.meta.db_read_latency_ms === null) source = 'tempo_total'
+
+      const order = Array.from({ length: 10 }, (_, index) =>
+        index % 2 === 0 ? ['strong', 'eventual'] : ['eventual', 'strong']
+      ).flat()
+
+      for (const mode of order) {
+        const startedAt = performance.now()
+        const data = await api.catalog.listGames({ consistency: mode })
+        const elapsed = performance.now() - startedAt
+        const dbLatency = data.meta.db_read_latency_ms
+        if (dbLatency === null) source = 'tempo_total'
+        runs[mode].push({
+          latency: dbLatency ?? elapsed,
+          served_by_node: data.meta.served_by_node,
+          games: data.items.length,
+        })
+      }
+
+      function summarize(mode) {
+        const items = runs[mode]
+        const total = items.reduce((sum, item) => sum + item.latency, 0)
         return {
           mode,
-          runs,
-          avg: total / runs.length,
-          served_by_node: runs[0]?.served_by_node || '',
+          runs: items,
+          avg: total / items.length,
+          served_by_node: items[0]?.served_by_node || '',
         }
       }
 
-      const strong = await sample('strong')
-      const eventual = await sample('eventual')
-      setBenchmark({ strong, eventual })
+      setBenchmark({ strong: summarize('strong'), eventual: summarize('eventual'), source })
     } catch (err) {
       setError(err.message)
     } finally {
@@ -453,7 +553,7 @@ export default function App() {
             search={search}
             setSearch={setSearch}
             consistency={consistency}
-            setConsistency={setConsistency}
+            onConsistencyChange={changeConsistency}
             onSearch={() => searchNearby()}
             onPickNeighborhood={(neighborhood) =>
               searchNearby({ lat: neighborhood.lat, lon: neighborhood.lon })
@@ -498,7 +598,7 @@ export default function App() {
 
         {tab === 'lab' && (
           <LabTab
-            games={nearby.items}
+            games={labGames}
             labGameId={labGameId}
             setLabGameId={setLabGameId}
             simRunning={simRunning}
@@ -544,7 +644,7 @@ function RenterTab({
   search,
   setSearch,
   consistency,
-  setConsistency,
+  onConsistencyChange,
   onSearch,
   onPickNeighborhood,
   onUseMyLocation,
@@ -625,7 +725,7 @@ function RenterTab({
           <Field label="Modo de consistência">
             <select
               value={consistency}
-              onChange={(event) => setConsistency(event.target.value)}
+              onChange={(event) => onConsistencyChange(event.target.value)}
             >
               <option value="strong">Forte (strong)</option>
               <option value="eventual">Eventual (eventual)</option>
@@ -1004,9 +1104,14 @@ function LabTab({
           <div>
             <h2>Nomeação e service discovery</h2>
             <p className="panel-sub">
-              URNs dos nós ativos, hostname DNS, IP resolvido e relógio de Lamport atual.
+              URNs dos nós ativos, hostname DNS, IP resolvido e relógio de Lamport em atualização automática.
             </p>
           </div>
+          <span className="meta-pill">
+            {discovery.updatedAt
+              ? `ao vivo · ${discovery.updatedAt.toLocaleTimeString('pt-BR')}`
+              : 'aguardando discovery'}
+          </span>
         </div>
 
         <div className="discovery-grid">
@@ -1031,7 +1136,7 @@ function LabTab({
           <div>
             <h2>Comparador visual de consistência</h2>
             <p className="panel-sub">
-              Executa 5 leituras seguidas em cada modo e calcula a latência média de leitura do banco.
+              Executa 5 leituras em cada modo, alternando a ordem, e calcula a latência média.
             </p>
           </div>
         </div>
@@ -1042,14 +1147,17 @@ function LabTab({
 
         {benchmark && (
           <div className="discovery-grid bench-grid">
-            <BenchmarkCard title="Consistência Forte" data={benchmark.strong} />
-            <BenchmarkCard title="Consistência Eventual" data={benchmark.eventual} />
+            <BenchmarkCard title="Consistência Forte" data={benchmark.strong} source={benchmark.source} />
+            <BenchmarkCard title="Consistência Eventual" data={benchmark.eventual} source={benchmark.source} />
           </div>
         )}
         {benchmark && (
           <p className="hint">
             Diferença de latência média: <strong>{Math.abs(benchmark.strong.avg - benchmark.eventual.avg).toFixed(2)} ms</strong>
             {' '}a favor da modalidade {benchmark.strong.avg <= benchmark.eventual.avg ? 'forte' : 'eventual'}.
+            {' '}Fonte: {benchmark.source === 'db_read_latency_ms'
+              ? 'latência de leitura do banco (X-DB-Read-Latency-Ms)'
+              : 'tempo total da requisição (header indisponível)'}.
           </p>
         )}
       </section>
@@ -1197,7 +1305,7 @@ function DiscoveryCard({ title, data, error }) {
   )
 }
 
-function BenchmarkCard({ title, data }) {
+function BenchmarkCard({ title, data, source }) {
   return (
     <article className="discovery-card bench-card">
       <div className="bench-head">
@@ -1205,7 +1313,10 @@ function BenchmarkCard({ title, data }) {
         <span className={`mode-badge ${data.mode}`}>{modeLabel(data.mode)}</span>
       </div>
       <strong className="bench-value">{Number(data.avg).toFixed(2)} ms</strong>
-      <p className="muted">Média de {data.runs.length} leituras</p>
+      <p className="muted">
+        Média de {data.runs.length} leituras ·{' '}
+        {source === 'db_read_latency_ms' ? 'latência do banco' : 'tempo total da requisição'}
+      </p>
       <p className="mono">served_by_node: {data.served_by_node || '—'}</p>
       <div className="bench-runs">
         {data.runs.map((run, index) => (
