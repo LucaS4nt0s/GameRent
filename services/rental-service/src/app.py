@@ -85,11 +85,12 @@ def _resolve_dns(target: str) -> DNSResolutionInfo:
 
 
 def _get_dynamodb_status() -> DynamoDBStatusInfo:
-    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL")
+    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL") or None
     name = os.getenv("RENTALS_TABLE_NAME", "gamerent_rentals")
     table = _get_ddb_table()
     if table is not None:
-        mode = "LOCAL_DYNAMODB" if endpoint and ("localhost" in endpoint or "127.0.0.1" in endpoint) else "AWS_DYNAMODB"
+        # Qualquer endpoint explícito é o DynamoDB Local (ex.: http://dynamodb-local:8000 no Compose)
+        mode = "LOCAL_DYNAMODB" if endpoint else "AWS_DYNAMODB"
         return DynamoDBStatusInfo(
             connected=True,
             table_name=name,
@@ -118,34 +119,47 @@ def _get_ddb_table():
     global _ddb_table
     if _ddb_table is not None:
         return _ddb_table
-    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL")
+    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL") or None
     if not (os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") or endpoint):
         return None
     try:
         import boto3
+        # dynamodb-local aceita qualquer credencial; na AWS deixamos o boto3 usar a cadeia padrão
+        # (IAM Role da EC2), sem injetar chaves fictícias que sobrescreveriam o Instance Profile.
+        creds = (
+            {
+                "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "local"),
+                "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "local"),
+            }
+            if endpoint
+            else {}
+        )
         ddb = boto3.resource(
             "dynamodb",
             region_name=os.getenv("AWS_REGION", "sa-east-1"),
             endpoint_url=endpoint,
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "test"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
+            **creds,
         )
         name = os.getenv("RENTALS_TABLE_NAME", "gamerent_rentals")
-        table = (
-            ddb.Table(name)
-            if name in [t.name for t in ddb.tables.all()]
-            else ddb.create_table(
-                TableName=name,
-                KeySchema=[{"AttributeName": "rental_id", "KeyType": "HASH"}],
-                AttributeDefinitions=[{"AttributeName": "rental_id", "AttributeType": "S"}],
-                BillingMode="PAY_PER_REQUEST",
+        try:
+            table = (
+                ddb.Table(name)
+                if name in [t.name for t in ddb.tables.all()]
+                else ddb.create_table(
+                    TableName=name,
+                    KeySchema=[{"AttributeName": "rental_id", "KeyType": "HASH"}],
+                    AttributeDefinitions=[{"AttributeName": "rental_id", "AttributeType": "S"}],
+                    BillingMode="PAY_PER_REQUEST",
+                )
             )
-        )
+        except ddb.meta.client.exceptions.ResourceInUseException:
+            table = ddb.Table(name)
         table.wait_until_exists()
         _ddb_table = table
         return _ddb_table
     except Exception as exc:
-        logger.warning(f"DynamoDB indisponível, operando com RENTALS_DB em memória: {exc}")
+        log = logger.error if os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") else logger.warning
+        log(f"DynamoDB indisponível, operando com RENTALS_DB em memória: {exc}")
         return None
 
 

@@ -47,8 +47,14 @@ docker compose up --build
 ```
 
 Os serviços estarão disponíveis em:
-* Catálogo: `http://localhost:8001` (Docs Swagger em `http://localhost:8001/docs`)
+* Catálogo — réplica 1: `http://localhost:8001` (Docs Swagger em `http://localhost:8001/docs`)
+* Catálogo — réplica 2: `http://localhost:8003`
 * Reservas: `http://localhost:8002` (Docs Swagger em `http://localhost:8002/docs`)
+* Front-end: `http://localhost:8080`
+* DynamoDB Local: `http://localhost:8000`
+
+As duas réplicas do catálogo compartilham a mesma tabela no DynamoDB Local. Detalhes da infraestrutura
+local e da IAM Role na AWS em [`infra/README.md`](infra/README.md).
 
 ---
 
