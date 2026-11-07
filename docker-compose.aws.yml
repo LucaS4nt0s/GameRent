@@ -1,0 +1,27 @@
+# Override para a EC2 na AWS (sa-east-1): usa o DynamoDB gerenciado em vez do dynamodb-local.
+# As credenciais vêm da IAM Role anexada à instância (Instance Profile) — nenhuma chave no código.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
+#
+# CATALOG_SERVICE_URL usa o nome simbólico do Route 53 (issue #5). Provisione a zona privada
+# com infra/setup_route53.sh antes de subir a stack na EC2.
+
+x-aws-managed: &aws-managed
+  USE_DYNAMODB: "true"
+  DYNAMODB_ENDPOINT_URL: ""
+
+services:
+  catalog-service:
+    environment:
+      <<: *aws-managed
+      INSTANCE_ID: ${CATALOG_1_INSTANCE_ID:-catalog-1}
+
+  catalog-service-2:
+    environment:
+      <<: *aws-managed
+      INSTANCE_ID: ${CATALOG_2_INSTANCE_ID:-catalog-2}
+
+  rental-service:
+    environment:
+      <<: *aws-managed
+      CATALOG_SERVICE_URL: "http://catalog.gamerent.internal:8001"

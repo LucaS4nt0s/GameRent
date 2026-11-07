@@ -3,7 +3,6 @@ import os
 import socket
 import threading
 import time
-import urllib.parse
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional
@@ -25,8 +24,12 @@ from models import (
     StatusUpdatePayload,
 )
 from geo_utils import calculate_haversine_distance
+import naming
 
-NODE_URN = f"urn:gamerent:node:catalog-service:{os.getenv('INSTANCE_ID') or socket.gethostname()}"
+SERVICE_NAME = "catalog-service"
+NODE_URN = naming.node_urn(SERVICE_NAME)
+# Nomes simbólicos deste nó: Route 53 / Cloud Map na AWS, aliases do Docker DNS localmente
+DNS_TARGETS = [t for t in os.getenv("DNS_DISCOVERY_TARGETS", f"catalog.{naming.INTERNAL_DOMAIN},catalog-service").split(",") if t]
 
 # Configuração de Logs
 logging.basicConfig(
@@ -53,9 +56,8 @@ app.add_middleware(
 _lock = threading.Lock()
 _lamport_clock = 0
 
-INSTANCE_ID = os.getenv("INSTANCE_ID", os.getenv("HOSTNAME", "node-catalog-01"))
-NODE_URN = f"urn:gamerent:node:catalog-service:{INSTANCE_ID}"
-DNS_TARGET = os.getenv("DNS_DISCOVERY_TARGET", "catalog.gamerent.internal")
+INSTANCE_ID = naming.instance_id()
+DNS_TARGET = os.getenv("DNS_DISCOVERY_TARGET", DNS_TARGETS[0])
 
 
 def tick_lamport(incoming: Optional[int] = None) -> int:
@@ -66,35 +68,23 @@ def tick_lamport(incoming: Optional[int] = None) -> int:
 
 
 def _resolve_dns(target: str) -> DNSResolutionInfo:
-    try:
-        host = target
-        if "://" in host:
-            host = urllib.parse.urlparse(host).hostname or host
-        if ":" in host:
-            host = host.split(":")[0]
-
-        addr_info = socket.getaddrinfo(host, None)
-        ips = list(dict.fromkeys([item[4][0] for item in addr_info]))
-        return DNSResolutionInfo(
-            target_hostname=host,
-            resolved_ips=ips,
-            status="RESOLVED"
-        )
-    except Exception as exc:
-        return DNSResolutionInfo(
-            target_hostname=target,
-            resolved_ips=[],
-            status="UNRESOLVED",
-            error_message=str(exc)
-        )
+    """Resolução via naming.resolve (timeout e log [DNS]) no formato DNSResolutionInfo."""
+    r = naming.resolve(target)
+    return DNSResolutionInfo(
+        target_hostname=r["hostname"],
+        resolved_ips=r["resolved_ips"],
+        status=r["status"],
+        error_message=r["error"],
+    )
 
 
 def _get_dynamodb_status() -> DynamoDBStatusInfo:
-    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL")
+    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL") or None
     name = os.getenv("GAMES_TABLE_NAME", "gamerent_games")
     table = _get_ddb_table()
     if table is not None:
-        mode = "LOCAL_DYNAMODB" if endpoint and ("localhost" in endpoint or "127.0.0.1" in endpoint) else "AWS_DYNAMODB"
+        # Qualquer endpoint explícito é o DynamoDB Local (ex.: http://dynamodb-local:8000 no Compose)
+        mode = "LOCAL_DYNAMODB" if endpoint else "AWS_DYNAMODB"
         return DynamoDBStatusInfo(
             connected=True,
             table_name=name,
@@ -181,29 +171,42 @@ def _get_ddb_table():
     global _ddb_table
     if _ddb_table is not None:
         return _ddb_table
-    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL")
+    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL") or None
     if not (os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") or endpoint):
         return None
     try:
         import boto3
+        # dynamodb-local aceita qualquer credencial; na AWS deixamos o boto3 usar a cadeia padrão
+        # (IAM Role da EC2), sem injetar chaves fictícias que sobrescreveriam o Instance Profile.
+        creds = (
+            {
+                "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "local"),
+                "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "local"),
+            }
+            if endpoint
+            else {}
+        )
         ddb = boto3.resource(
             "dynamodb",
             region_name=os.getenv("AWS_REGION", "sa-east-1"),
             endpoint_url=endpoint,
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "test"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
+            **creds,
         )
         name = os.getenv("GAMES_TABLE_NAME", "gamerent_games")
-        table = (
-            ddb.Table(name)
-            if name in [t.name for t in ddb.tables.all()]
-            else ddb.create_table(
-                TableName=name,
-                KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
-                AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "N"}],
-                BillingMode="PAY_PER_REQUEST",
+        try:
+            table = (
+                ddb.Table(name)
+                if name in [t.name for t in ddb.tables.all()]
+                else ddb.create_table(
+                    TableName=name,
+                    KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+                    AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "N"}],
+                    BillingMode="PAY_PER_REQUEST",
+                )
             )
-        )
+        except ddb.meta.client.exceptions.ResourceInUseException:
+            # Outra réplica do catalog-service criou a tabela ao mesmo tempo
+            table = ddb.Table(name)
         table.wait_until_exists()
         if not table.scan(Limit=1).get("Items"):
             for g in GAMES_DB.values():
@@ -211,7 +214,9 @@ def _get_ddb_table():
         _ddb_table = table
         return _ddb_table
     except Exception as exc:
-        logger.warning(f"DynamoDB indisponível, operando com GAMES_DB em memória: {exc}")
+        # Com USE_DYNAMODB=true (AWS) cair para memória quebra o estado compartilhado entre réplicas
+        log = logger.error if os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") else logger.warning
+        log(f"DynamoDB indisponível, operando com GAMES_DB em memória: {exc}")
         return None
 
 
@@ -310,14 +315,26 @@ def health_check(
     clock = tick_lamport(x_lamport_clock)
     if response:
         response.headers["X-Lamport-Clock"] = str(clock)
+    # Conta pela fonte de verdade (DynamoDB quando ativo), igual em todas as réplicas
+    games, _ = _read_games("eventual")
     return {
         "status": "HEALTHY",
         "service": "catalog-service",
         "node_urn": NODE_URN,
         "instance_id": INSTANCE_ID,
-        "total_games": len(GAMES_DB),
+        "total_games": len(games),
         "lamport_clock": clock
     }
+
+
+def log_dns_resolution():
+    logger.info(f"Nó {NODE_URN} iniciado")
+    for target in DNS_TARGETS:
+        naming.resolve(target)
+
+
+# Executa uma vez ao carregar o módulo (antes de o uvicorn aceitar conexões)
+log_dns_resolution()
 
 
 @app.get("/discovery", response_model=DiscoveryResponse, tags=["Observabilidade"])
@@ -331,26 +348,19 @@ def get_discovery(
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
 
-    hostname = socket.gethostname()
-    try:
-        local_ip = socket.gethostbyname(hostname)
-    except Exception:
-        local_ip = "127.0.0.1"
-
-    dns_info = _resolve_dns(DNS_TARGET)
-    ddb_info = _get_dynamodb_status()
-
+    extras = naming.naming_extras(DNS_TARGETS)
     return DiscoveryResponse(
         service="catalog-service",
         node_urn=NODE_URN,
         instance_id=INSTANCE_ID,
-        hostname=hostname,
-        local_ip=local_ip,
+        hostname=socket.gethostname(),
+        local_ip=(extras["local_ips"] or ["127.0.0.1"])[0],
         dns_target=DNS_TARGET,
-        dns_resolution=dns_info,
+        dns_resolution=_resolve_dns(DNS_TARGET),
         lamport_clock=clock,
-        dynamodb=ddb_info,
-        timestamp=datetime.now(timezone.utc).isoformat()
+        dynamodb=_get_dynamodb_status(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        **extras,
     )
 
 
@@ -439,7 +449,7 @@ def update_game_status(
     """
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
-    logger.info(f"[LAMPORT={clock}] Atualização de status do jogo ID={game_id} para {payload.status}")
+    logger.info(f"[LAMPORT={clock}] Atualização de status do jogo ID={game_id} para {payload.status.value}")
 
     with _lock:
         if game_id not in GAMES_DB:
@@ -453,10 +463,10 @@ def update_game_status(
             (game.status == GameStatus.RENTED and payload.status != GameStatus.AVAILABLE)
             or (game.status == GameStatus.MAINTENANCE and payload.status == GameStatus.RENTED)
         ):
-            logger.warning(f"[LAMPORT={clock}] Conflito 409: tentativa de alterar jogo ID={game_id} de {game.status} para {payload.status}")
+            logger.warning(f"[LAMPORT={clock}] Conflito 409: tentativa de alterar jogo ID={game_id} de {game.status.value} para {payload.status.value}")
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Transição inválida de '{game.status}' para '{payload.status}' no jogo '{game.title}'."
+                detail=f"Transição inválida de '{game.status.value}' para '{payload.status.value}' no jogo '{game.title}'."
             )
 
         game.status = payload.status
@@ -498,10 +508,10 @@ def reserve_game(
             return _save_game(game)
 
         if game.status != GameStatus.AVAILABLE:
-            logger.warning(f"[LAMPORT={clock}] Conflito 409: Jogo ID={game_id} indisponível para reserva (status atual: {game.status})")
+            logger.warning(f"[LAMPORT={clock}] Conflito 409: Jogo ID={game_id} indisponível para reserva (status atual: {game.status.value})")
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"O jogo '{game.title}' não está disponível para reserva no momento (status atual: {game.status})."
+                detail=f"O jogo '{game.title}' não está disponível para reserva no momento (status atual: {game.status.value})."
             )
 
         prev_status = game.status

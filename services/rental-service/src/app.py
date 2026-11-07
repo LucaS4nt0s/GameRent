@@ -2,7 +2,6 @@ import logging
 import os
 import socket
 import threading
-import urllib.parse
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -23,6 +22,7 @@ from catalog_client import (
     GameConflictError,
     GameNotFoundError,
 )
+import naming
 
 # Configuração de Logs
 logging.basicConfig(
@@ -48,9 +48,12 @@ app.add_middleware(
 _lock = threading.Lock()
 _lamport_clock = 0
 
-INSTANCE_ID = os.getenv("INSTANCE_ID", os.getenv("HOSTNAME", "node-rental-01"))
-NODE_URN = f"urn:gamerent:node:rental-service:{INSTANCE_ID}"
-DNS_TARGET = os.getenv("DNS_DISCOVERY_TARGET", os.getenv("CATALOG_SERVICE_URL", "catalog.gamerent.internal"))
+SERVICE_NAME = "rental-service"
+INSTANCE_ID = naming.instance_id()
+NODE_URN = naming.node_urn(SERVICE_NAME, INSTANCE_ID)
+DNS_TARGET = os.getenv("DNS_DISCOVERY_TARGET", os.getenv("CATALOG_SERVICE_URL", f"catalog.{naming.INTERNAL_DOMAIN}"))
+# dns[0] é o catálogo (o que este nó precisa achar); depois o próprio nome do rental
+DNS_TARGETS = [DNS_TARGET, f"rental.{naming.INTERNAL_DOMAIN}"]
 
 
 def tick_lamport(incoming: Optional[int] = None) -> int:
@@ -61,35 +64,23 @@ def tick_lamport(incoming: Optional[int] = None) -> int:
 
 
 def _resolve_dns(target: str) -> DNSResolutionInfo:
-    try:
-        host = target
-        if "://" in host:
-            host = urllib.parse.urlparse(host).hostname or host
-        if ":" in host:
-            host = host.split(":")[0]
-
-        addr_info = socket.getaddrinfo(host, None)
-        ips = list(dict.fromkeys([item[4][0] for item in addr_info]))
-        return DNSResolutionInfo(
-            target_hostname=host,
-            resolved_ips=ips,
-            status="RESOLVED"
-        )
-    except Exception as exc:
-        return DNSResolutionInfo(
-            target_hostname=target,
-            resolved_ips=[],
-            status="UNRESOLVED",
-            error_message=str(exc)
-        )
+    """Resolução via naming.resolve (timeout e log [DNS]) no formato DNSResolutionInfo."""
+    r = naming.resolve(target)
+    return DNSResolutionInfo(
+        target_hostname=r["hostname"],
+        resolved_ips=r["resolved_ips"],
+        status=r["status"],
+        error_message=r["error"],
+    )
 
 
 def _get_dynamodb_status() -> DynamoDBStatusInfo:
-    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL")
+    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL") or None
     name = os.getenv("RENTALS_TABLE_NAME", "gamerent_rentals")
     table = _get_ddb_table()
     if table is not None:
-        mode = "LOCAL_DYNAMODB" if endpoint and ("localhost" in endpoint or "127.0.0.1" in endpoint) else "AWS_DYNAMODB"
+        # Qualquer endpoint explícito é o DynamoDB Local (ex.: http://dynamodb-local:8000 no Compose)
+        mode = "LOCAL_DYNAMODB" if endpoint else "AWS_DYNAMODB"
         return DynamoDBStatusInfo(
             connected=True,
             table_name=name,
@@ -118,34 +109,47 @@ def _get_ddb_table():
     global _ddb_table
     if _ddb_table is not None:
         return _ddb_table
-    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL")
+    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL") or None
     if not (os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") or endpoint):
         return None
     try:
         import boto3
+        # dynamodb-local aceita qualquer credencial; na AWS deixamos o boto3 usar a cadeia padrão
+        # (IAM Role da EC2), sem injetar chaves fictícias que sobrescreveriam o Instance Profile.
+        creds = (
+            {
+                "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "local"),
+                "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "local"),
+            }
+            if endpoint
+            else {}
+        )
         ddb = boto3.resource(
             "dynamodb",
             region_name=os.getenv("AWS_REGION", "sa-east-1"),
             endpoint_url=endpoint,
-            aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID", "test"),
-            aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY", "test"),
+            **creds,
         )
         name = os.getenv("RENTALS_TABLE_NAME", "gamerent_rentals")
-        table = (
-            ddb.Table(name)
-            if name in [t.name for t in ddb.tables.all()]
-            else ddb.create_table(
-                TableName=name,
-                KeySchema=[{"AttributeName": "rental_id", "KeyType": "HASH"}],
-                AttributeDefinitions=[{"AttributeName": "rental_id", "AttributeType": "S"}],
-                BillingMode="PAY_PER_REQUEST",
+        try:
+            table = (
+                ddb.Table(name)
+                if name in [t.name for t in ddb.tables.all()]
+                else ddb.create_table(
+                    TableName=name,
+                    KeySchema=[{"AttributeName": "rental_id", "KeyType": "HASH"}],
+                    AttributeDefinitions=[{"AttributeName": "rental_id", "AttributeType": "S"}],
+                    BillingMode="PAY_PER_REQUEST",
+                )
             )
-        )
+        except ddb.meta.client.exceptions.ResourceInUseException:
+            table = ddb.Table(name)
         table.wait_until_exists()
         _ddb_table = table
         return _ddb_table
     except Exception as exc:
-        logger.warning(f"DynamoDB indisponível, operando com RENTALS_DB em memória: {exc}")
+        log = logger.error if os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") else logger.warning
+        log(f"DynamoDB indisponível, operando com RENTALS_DB em memória: {exc}")
         return None
 
 
@@ -244,6 +248,13 @@ def health_check(
         "lamport_clock": clock
     }
 
+def log_dns_resolution():
+    logger.info(f"Nó {NODE_URN} iniciado; catálogo em {catalog_client.base_url}")
+    naming.resolve(catalog_client.base_url)
+
+
+# Executa uma vez ao carregar o módulo (antes de o uvicorn aceitar conexões)
+log_dns_resolution()
 
 @app.get("/discovery", response_model=DiscoveryResponse, tags=["Observabilidade"])
 def get_discovery(
@@ -256,26 +267,19 @@ def get_discovery(
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
 
-    hostname = socket.gethostname()
-    try:
-        local_ip = socket.gethostbyname(hostname)
-    except Exception:
-        local_ip = "127.0.0.1"
-
-    dns_info = _resolve_dns(DNS_TARGET)
-    ddb_info = _get_dynamodb_status()
-
+    extras = naming.naming_extras(DNS_TARGETS)
     return DiscoveryResponse(
         service="rental-service",
         node_urn=NODE_URN,
         instance_id=INSTANCE_ID,
-        hostname=hostname,
-        local_ip=local_ip,
+        hostname=socket.gethostname(),
+        local_ip=(extras["local_ips"] or ["127.0.0.1"])[0],
         dns_target=DNS_TARGET,
-        dns_resolution=dns_info,
+        dns_resolution=_resolve_dns(DNS_TARGET),
         lamport_clock=clock,
-        dynamodb=ddb_info,
-        timestamp=datetime.now(timezone.utc).isoformat()
+        dynamodb=_get_dynamodb_status(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        **extras,
     )
 
 
@@ -306,22 +310,22 @@ async def create_rental(
     except GameConflictError as exc:
         # Rejeição imediata com 409 Conflict
         logger.warning(f"[LAMPORT={clock}] Reserva rejeitada com 409 Conflict: {exc}")
-        response.headers["X-Lamport-Clock"] = str(clock)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=str(exc)
+            detail=str(exc),
+            headers={"X-Lamport-Clock": str(clock)}
         )
     except GameNotFoundError as exc:
-        response.headers["X-Lamport-Clock"] = str(clock)
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(exc)
+            detail=str(exc),
+            headers={"X-Lamport-Clock": str(clock)}
         )
     except CatalogCommunicationError as exc:
-        response.headers["X-Lamport-Clock"] = str(clock)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Falha de comunicação inter-serviços: {exc}"
+            detail=f"Falha de comunicação inter-serviços: {exc}",
+            headers={"X-Lamport-Clock": str(clock)}
         )
 
     # Sincroniza o relógio de Lamport com o relógio retornado pelo catálogo
@@ -347,6 +351,8 @@ async def create_rental(
         "status": RentalStatus.CONFIRMED,
         "lamport_clock": clock,
         "created_at": created_at_iso,
+        # URN canônico vem do catálogo (dono do recurso), não é recalculado com a região deste nó
+        "game_urn": game_data.get("urn", ""),
         "returned_at": None
     }
 
@@ -362,10 +368,10 @@ async def create_rental(
             )
         except Exception as rollback_err:
             logger.critical(f"Falha catastrófica ao tentar compensar reserva do jogo {payload.game_id}: {rollback_err}")
-        response.headers["X-Lamport-Clock"] = str(clock)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Erro interno ao registrar locação. A reserva do exemplar foi cancelada: {exc}"
+            detail=f"Erro interno ao registrar locação. A reserva do exemplar foi cancelada: {exc}",
+            headers={"X-Lamport-Clock": str(clock)}
         )
 
     logger.info(f"[LAMPORT={clock}] Aluguel confirmado com sucesso! ID={rental_id}, URN={resp_obj.urn}, Total=R$ {total_price}")

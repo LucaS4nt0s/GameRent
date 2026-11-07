@@ -1,0 +1,71 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DynamoDBTabelasGameRent",
+      "Effect": "Allow",
+      "Action": "dynamodb:*",
+      "Resource": [
+        "arn:aws:dynamodb:sa-east-1:*:table/gamerent_*",
+        "arn:aws:dynamodb:sa-east-1:*:table/gamerent_*/index/*"
+      ]
+    },
+    {
+      "Sid": "DynamoDBListTables",
+      "Effect": "Allow",
+      "Action": "dynamodb:ListTables",
+      "Resource": "*"
+    },
+    {
+      "Sid": "Route53SemRecursoEspecifico",
+      "Effect": "Allow",
+      "Action": [
+        "route53:ListHostedZones",
+        "route53:ListHostedZonesByName",
+        "route53:CreateHostedZone",
+        "route53:GetChange"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "Route53LeituraZonas",
+      "Effect": "Allow",
+      "Action": [
+        "route53:GetHostedZone",
+        "route53:ListResourceRecordSets",
+        "route53:AssociateVPCWithHostedZone"
+      ],
+      "Resource": "arn:aws:route53:::hostedzone/*"
+    },
+    {
+      "Sid": "Route53SoRegistrosGameRentInternal",
+      "Effect": "Allow",
+      "Action": "route53:ChangeResourceRecordSets",
+      "Resource": "arn:aws:route53:::hostedzone/*",
+      "Condition": {
+        "ForAllValues:StringLike": {
+          "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
+            "gamerent.internal",
+            "*.gamerent.internal"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "CloudMapDescoberta",
+      "Effect": "Allow",
+      "Action": [
+        "servicediscovery:DiscoverInstances",
+        "servicediscovery:Get*",
+        "servicediscovery:List*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "LeituraEc2ParaSetupRoute53",
+      "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeVpcs", "ec2:DescribeVpcAttribute"],
+      "Resource": "*"
+    }
+  ]
+}
