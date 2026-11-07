@@ -41,19 +41,29 @@ def wait_healthy(base: str, attempts: int = 30) -> dict:
             status, body = req(f"{base}/health")
             if status == 200:
                 return body
-        except (urllib.error.URLError, ConnectionError):
+        except Exception:
             pass
         time.sleep(1)
     raise AssertionError(f"{base} não ficou saudável a tempo")
 
 
+def wait_dynamodb(attempts: int = 30) -> int:
+    """O container demora alguns segundos para aceitar conexões após o `compose up`."""
+    last_error: Exception | None = None
+    for _ in range(attempts):
+        try:
+            status, _ = req(DYNAMODB)
+            if status in (200, 400):
+                return status
+        except Exception as exc:
+            last_error = exc
+        time.sleep(1)
+    raise AssertionError(f"dynamodb-local inacessível em {DYNAMODB}: {last_error}")
+
+
 if __name__ == "__main__":
     # 1. DynamoDB Local acessível (qualquer requisição HTTP sem assinatura devolve 400, mas prova que está de pé)
-    try:
-        status, _ = req(DYNAMODB)
-    except urllib.error.URLError as exc:
-        raise AssertionError(f"dynamodb-local inacessível em {DYNAMODB}: {exc}")
-    assert status in (200, 400), f"dynamodb-local respondeu {status}"
+    status = wait_dynamodb()
     print(f"[1/3] dynamodb-local de pé em {DYNAMODB}")
 
     # 2. Duas réplicas saudáveis com URNs de nó distintos
