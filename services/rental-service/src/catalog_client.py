@@ -160,12 +160,16 @@ class CatalogClient:
             if response.status_code == 200:
                 logger.info(f"Liberação do jogo {game_id} confirmada pelo catálogo remoto.")
                 return response.json()
+            elif response.status_code == 409:
+                err_detail = response.json().get("detail", "Operação negada na liberação do jogo.")
+                logger.warning(f"Conflito 409 reportado pelo catálogo na liberação do jogo {game_id}: {err_detail}")
+                raise GameConflictError(err_detail)
             elif response.status_code == 404:
                 raise GameNotFoundError(f"Jogo {game_id} não encontrado no catálogo para liberação.")
             else:
                 raise CatalogCommunicationError(f"Erro ao liberar jogo no catálogo: {response.status_code}")
 
-        except GameNotFoundError:
+        except (GameConflictError, GameNotFoundError):
             raise
         except httpx.RequestError as exc:
             logger.error(f"Falha de rede na liberação em {url}: {exc}")

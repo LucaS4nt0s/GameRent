@@ -11,10 +11,10 @@ class RentalStatus(str, Enum):
     COMPLETED = "COMPLETED"
 
 class RentalCreateRequest(BaseModel):
-    renter_name: str = Field(..., example="João da Silva")
-    renter_email: str = Field(..., example="joao.silva@exemplo.com")
-    game_id: int = Field(..., example=1)
-    rental_days: int = Field(..., gt=0, example=3)
+    renter_name: str = Field(..., min_length=1, example="João da Silva")
+    renter_email: str = Field(..., min_length=3, example="joao.silva@exemplo.com")
+    game_id: int = Field(..., gt=0, example=1)
+    rental_days: int = Field(..., gt=0, le=365, example=3)
 
 class RentalResponse(BaseModel):
     rental_id: str

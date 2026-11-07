@@ -50,6 +50,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Lamport-Clock", "X-Consistency-Mode", "X-DB-Read-Latency-Ms", "X-Served-By-Node"],
 )
 
 # ponytail: lock em memória por processo; migrar para DynamoDB ConditionalExpression em multi-réplica
@@ -208,9 +209,16 @@ def _get_ddb_table():
             # Outra réplica do catalog-service criou a tabela ao mesmo tempo
             table = ddb.Table(name)
         table.wait_until_exists()
-        if not table.scan(Limit=1).get("Items"):
+        items = table.scan().get("Items", [])
+        if not items:
             for g in GAMES_DB.values():
                 _put_ddb_game(table, g)
+        else:
+            for it in items:
+                try:
+                    GAMES_DB[int(it["id"])] = Game(**it)
+                except Exception:
+                    pass
         _ddb_table = table
         return _ddb_table
     except Exception as exc:
@@ -253,6 +261,50 @@ def _reserve_ddb_game(table, game_id: int, rental_id: str, renter_name: str, clo
             raise
         logger.warning(f"Erro na reserva condicional do DynamoDB para jogo {game_id}: {exc}")
         return False
+
+
+def _release_ddb_game(table, game_id: int, rental_id: Optional[str], is_forced: bool, clock: int) -> bool:
+    """Liberação atômica condicional no DynamoDB: restaura status para AVAILABLE."""
+    try:
+        expr_names = {"#st": "status"}
+        expr_vals = {
+            ":avail": GameStatus.AVAILABLE.value,
+            ":inc": 1,
+            ":clk": clock,
+            ":upd": datetime.now(timezone.utc).isoformat(),
+        }
+        cond = "attribute_exists(id)"
+        if not is_forced and rental_id:
+            cond += " AND (current_rental_id = :rid OR attribute_not_exists(current_rental_id))"
+            expr_vals[":rid"] = rental_id
+        table.update_item(
+            Key={"id": game_id},
+            UpdateExpression="SET #st = :avail, version = version + :inc, lamport_clock = :clk, updated_at = :upd REMOVE current_rental_id, current_renter_name",
+            ConditionExpression=cond,
+            ExpressionAttributeNames=expr_names,
+            ExpressionAttributeValues=expr_vals,
+        )
+        return True
+    except Exception as exc:
+        if "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc):
+            raise
+        logger.warning(f"Erro na liberação condicional do DynamoDB para jogo {game_id}: {exc}")
+        return False
+
+
+def _get_game_for_mutation(game_id: int) -> Optional[Game]:
+    """Obtém o jogo para mutação, sincronizando com DynamoDB com ConsistentRead."""
+    table = _get_ddb_table()
+    if table is not None:
+        try:
+            item = table.get_item(Key={"id": game_id}, ConsistentRead=True).get("Item")
+            if item:
+                game = Game(**item)
+                GAMES_DB[game_id] = game
+                return game
+        except Exception as exc:
+            logger.warning(f"Erro ao sincronizar jogo {game_id} do DynamoDB: {exc}")
+    return GAMES_DB.get(game_id)
 
 
 def _save_game(game: Game) -> GamePublicResponse:
@@ -374,7 +426,15 @@ def create_game(
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
     with _lock:
-        new_id = max(GAMES_DB.keys(), default=0) + 1
+        table = _get_ddb_table()
+        max_id = max(GAMES_DB.keys(), default=0)
+        if table is not None:
+            try:
+                items = table.scan(ProjectionExpression="id").get("Items", [])
+                max_id = max(max_id, max([int(it["id"]) for it in items], default=0))
+            except Exception:
+                pass
+        new_id = max_id + 1
         game = Game(id=new_id, lamport_clock=clock, **payload.model_dump())
         GAMES_DB[new_id] = game
     logger.info(f"[LAMPORT={clock}] Novo jogo cadastrado: ID={new_id}, URN={game.urn}")
@@ -452,13 +512,13 @@ def update_game_status(
     logger.info(f"[LAMPORT={clock}] Atualização de status do jogo ID={game_id} para {payload.status.value}")
 
     with _lock:
-        if game_id not in GAMES_DB:
+        game = _get_game_for_mutation(game_id)
+        if game is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Jogo com ID {game_id} não encontrado no catálogo."
             )
 
-        game = GAMES_DB[game_id]
         if (
             (game.status == GameStatus.RENTED and payload.status != GameStatus.AVAILABLE)
             or (game.status == GameStatus.MAINTENANCE and payload.status == GameStatus.RENTED)
@@ -493,14 +553,13 @@ def reserve_game(
     logger.info(f"[LAMPORT={clock}] Tentativa de reserva atômica para o jogo ID={game_id} (Rental={payload.rental_id}, Locatário={payload.renter_name})")
 
     with _lock:
-        if game_id not in GAMES_DB:
+        game = _get_game_for_mutation(game_id)
+        if game is None:
             logger.warning(f"Jogo ID={game_id} não encontrado para reserva.")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Jogo com ID {game_id} não encontrado no catálogo."
             )
-
-        game = GAMES_DB[game_id]
 
         # Idempotência: se já estiver RENTED para o mesmo rental_id, confirma sem erro
         if game.status == GameStatus.RENTED and game.current_rental_id == payload.rental_id:
@@ -538,6 +597,8 @@ def reserve_game(
                 game.current_renter_name = prev_renter
                 game.version = prev_ver
             if "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc):
+                # Sincroniza estado real do DynamoDB em caso de disputa concorrente
+                _get_game_for_mutation(game_id)
                 logger.warning(f"[LAMPORT={clock}] DynamoDB ConditionalCheckFailedException para jogo ID={game_id}")
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
@@ -569,14 +630,13 @@ def release_game(
     is_forced = force or (payload.force if payload else False)
 
     with _lock:
-        if game_id not in GAMES_DB:
+        game = _get_game_for_mutation(game_id)
+        if game is None:
             logger.warning(f"Jogo ID={game_id} não encontrado para liberação.")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Jogo com ID {game_id} não encontrado no catálogo."
             )
-
-        game = GAMES_DB[game_id]
 
         # Validação de segurança: se o jogo estiver RENTED com um rental_id ativo,
         # exige confirmação do rental_id correspondente (salvo se liberação forçada)
@@ -599,8 +659,20 @@ def release_game(
         game.lamport_clock = clock
         game.updated_at = datetime.now(timezone.utc).isoformat()
 
+    table = _get_ddb_table()
+    if table is not None:
+        try:
+            _release_ddb_game(table, game_id, payload.rental_id if payload else None, is_forced, clock)
+        except Exception as exc:
+            if "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Operação negada: o rental_id informado não corresponde à locação ativa do jogo '{game.title}'."
+                )
+            logger.warning(f"Erro ao persistir liberação no DynamoDB: {exc}")
+
     logger.info(f"[LAMPORT={clock}] Jogo ID={game_id} liberado com sucesso para AVAILABLE.")
-    return _save_game(game)
+    return GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN)
 
 
 if __name__ == "__main__":
