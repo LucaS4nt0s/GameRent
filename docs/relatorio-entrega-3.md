@@ -16,7 +16,7 @@
 > devem receber prints do console AWS e a saída de `scripts/test_entrega3.py` (issue #10) antes da
 > exportação para PDF (ver seção 9). Já estão em `dev`: reserva e liberação atômicas (#21), painel de
 > locações (#22) e `/discovery` com Lamport nos dois serviços (#24). Ainda em PRs abertos: infraestrutura
-> (#25) e nomeação (#26). Revise o texto depois do merge de cada um.
+> (#25), nomeação (#26) e as abas do aplicativo (#28). Revise o texto depois do merge de cada um.
 
 ---
 
@@ -42,7 +42,7 @@ A Entrega 3 ataca três blocos do conteúdo da disciplina:
 ```
                          +-----------------------------------------+
                          |   Navegador — Front-end React (8080)    |
-                         |   URN, Lamport e status ao vivo         |
+                         |   Locatário · Locador · Laboratório     |
                          +--------------------+--------------------+
                                               | HTTP (nginx /api/*)
                     +-------------------------+--------------------------+
@@ -281,23 +281,37 @@ cliente qual versão ele recebeu, e `served_by_node` mostra qual réplica respon
 
 ---
 
-## 6. Interface Web (issue #11)
+## 6. Interface Web (issues #11, #17, #18 e #19 — PR #28)
 
-O front-end (`frontend/`, React servido por nginx na porta 8080) passou a mostrar os metadados
-distribuídos:
+O front-end (`frontend/`, React servido por nginx na porta 8080) foi reorganizado em três abas que
+servem tanto ao produto quanto à demonstração dos blocos 4, 5 e 6. A interface relê catálogo, locações
+e saúde em segundo plano a cada 3 s, então uma reserva ou devolução feita por outro cliente aparece sem
+recarregar a página.
 
-- **Faixa do nó** no topo: URN do nó do catálogo que respondeu, valor atual do relógio de Lamport (via
-  `/health`) e o horário da última atualização.
-- **Cards de jogos:** URN do jogo (`urn:gamerent:game:sa-east-1:{id}`), `lamport_clock` da última
-  escrita (`L=n`) e versão (`v{n}`).
-- **Status de bloqueio em tempo real:** jogos `RENTED` aparecem acinzentados com o aviso "Bloqueado pela
-  locação …". A interface relê catálogo, locações e saúde em segundo plano: cada ciclo começa 3 s depois
-  do anterior terminar, e uma resposta atrasada nunca sobrescreve uma mais nova. Uma reserva ou devolução
-  feita por outro cliente aparece sem recarregar a página. Se o jogo for bloqueado enquanto o formulário
-  de aluguel está aberto, o botão de confirmar é desativado.
-- **Pedidos:** cada locação mostra seu URN `urn:gamerent:rental:{uuid}`.
+**Aba 1 — Locatário (#17).**
+- Busca geográfica com atalhos de bairros de São Paulo, latitude/longitude e raio `max_km`. As
+  coordenadas do locador nunca saem do servidor; o cliente recebe só a distância relativa.
+- Seletor de consistência **Forte** ou **Eventual**, com badges de `db_read_latency_ms` e
+  `served_by_node` da resposta (bloco 6).
+- Cards com URN do jogo, versão e relógio de Lamport da última escrita.
+- Aluguel e "Minhas locações" com devolução (`POST /rentals/{id}/return`).
 
-> **[EVIDÊNCIA PENDENTE]** Print da interface com um jogo bloqueado e a faixa do nó visível.
+**Aba 2 — Locador (#18).**
+- Cadastro de jogo (`POST /games`), que já mostra o URN gerado (bloco 5), com aviso de privacidade
+  geográfica.
+- Acervo com alternância `AVAILABLE` ↔ `MAINTENANCE` (`PATCH /games/{id}/status`).
+
+**Aba 3 — Laboratório de Sistemas Distribuídos (#19).**
+- **Disputa concorrente (bloco 4):** dispara 10 reservas simultâneas do mesmo jogo e mostra cada
+  resposta com seu relógio de Lamport. O resultado esperado é 1 × `201 Created` e 9 × `409 Conflict`.
+- **Nomeação e service discovery (bloco 5):** consulta `GET /discovery` dos dois serviços a cada 5 s e
+  mostra URN do nó, nome DNS, IP resolvido, modo do DynamoDB e Lamport.
+- **Comparador de consistência (bloco 6):** 5 leituras em cada modo, alternando a ordem, com a latência
+  média de leitura do banco.
+
+> **[EVIDÊNCIA PENDENTE]** Prints das três abas: o simulador com 1 × 201 e 9 × 409, o painel de discovery
+> na EC2 resolvendo `catalog.gamerent.internal` e o comparador de consistência rodando contra o DynamoDB
+> da AWS.
 
 ---
 
