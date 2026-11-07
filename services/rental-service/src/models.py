@@ -3,6 +3,8 @@ from enum import Enum
 from typing import List, Optional
 from pydantic import BaseModel, Field
 
+import naming
+
 class RentalStatus(str, Enum):
     CONFIRMED = "CONFIRMED"
     CANCELLED = "CANCELLED"
@@ -29,12 +31,19 @@ class RentalResponse(BaseModel):
     lamport_clock: int = 1
     created_at: str
     returned_at: Optional[str] = None
+    served_by_node: str = ""
 
     def model_post_init(self, __context) -> None:
-        if not self.urn and self.rental_id:
-            self.urn = f"urn:gamerent:rental:{self.rental_id}"
-        if not self.game_urn and self.game_id:
-            self.game_urn = f"urn:gamerent:game:sa-east-1:{self.game_id}"
+        if not self.urn:
+            try:
+                self.urn = naming.rental_urn(self.rental_id)
+            except ValueError:
+                # Registro legado com id fora do padrão UUID: não derruba a listagem inteira
+                self.urn = ""
+        if not self.game_urn:
+            self.game_urn = naming.game_urn(self.game_id)
+        if not self.served_by_node:
+            self.served_by_node = naming.node_urn("rental-service")
 
 
 class DNSResolutionInfo(BaseModel):
@@ -62,5 +71,11 @@ class DiscoveryResponse(BaseModel):
     lamport_clock: int
     dynamodb: DynamoDBStatusInfo
     timestamp: str
+    # Esquema formal de nomeação (issue #5)
+    region: Optional[str] = None
+    local_ips: List[str] = Field(default_factory=list)
+    internal_domain: Optional[str] = None
+    dns: List[dict] = Field(default_factory=list)
+    urn_schema: dict = Field(default_factory=dict)
 
 
