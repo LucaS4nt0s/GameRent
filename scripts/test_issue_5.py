@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -34,11 +35,23 @@ def check(kind: str, value: str) -> dict:
     return parsed
 
 
+def wait_healthy(base: str, attempts: int = 30) -> dict:
+    """O `compose up` retorna antes de o serviço aceitar conexões."""
+    for _ in range(attempts):
+        try:
+            status, body = req(f"{base}/health")
+            if status == 200:
+                return body
+        except Exception:
+            pass
+        time.sleep(1)
+    raise AssertionError(f"{base} não ficou saudável a tempo")
+
+
 if __name__ == "__main__":
     # 1. /health expõe URN e INSTANCE_ID do nó
     for base, service in ((CATALOG, "catalog-service"), (RENTAL, "rental-service")):
-        status, health = req(f"{base}/health")
-        assert status == 200
+        health = wait_healthy(base)
         node = check("node", health["node_urn"])
         assert node["service_name"] == service
         assert health["node_urn"] == naming.node_urn(service, health["instance_id"])
