@@ -485,7 +485,7 @@ export default function App() {
       const warmup = await api.catalog.listGames({ consistency: 'eventual' })
       if (warmup.meta.db_read_latency_ms === null) source = 'tempo_total'
 
-      const order = Array.from({ length: 10 }, (_, index) =>
+      const order = Array.from({ length: 5 }, (_, index) =>
         index % 2 === 0 ? ['strong', 'eventual'] : ['eventual', 'strong']
       ).flat()
 
