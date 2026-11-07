@@ -19,11 +19,11 @@ CATALOG = "http://127.0.0.1:8001"
 RENTAL = "http://127.0.0.1:8002"
 
 
-def req(url: str, method: str = "GET", body: dict | None = None):
+def req(url: str, method: str = "GET", body: dict | None = None, timeout: int = 15):
     data = json.dumps(body).encode("utf-8") if body is not None else None
     r = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(r, timeout=15) as resp:
+        with urllib.request.urlopen(r, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read().decode("utf-8"))
@@ -48,6 +48,19 @@ def wait_healthy(base: str, attempts: int = 30) -> dict:
     raise AssertionError(f"{base} não ficou saudável a tempo")
 
 
+def wait_discovery(base: str, attempts: int = 30) -> dict:
+    """A primeira chamada pode criar a tabela no DynamoDB e demorar mais que o timeout padrão."""
+    for _ in range(attempts):
+        try:
+            status, body = req(f"{base}/discovery", timeout=30)
+            if status == 200:
+                return body
+        except Exception:
+            pass
+        time.sleep(1)
+    raise AssertionError(f"{base}/discovery não respondeu a tempo")
+
+
 if __name__ == "__main__":
     # 1. /health expõe URN e INSTANCE_ID do nó
     for base, service in ((CATALOG, "catalog-service"), (RENTAL, "rental-service")):
@@ -61,8 +74,8 @@ if __name__ == "__main__":
     #    No rental-service o alvo inclui o host de CATALOG_SERVICE_URL, que precisa resolver
     #    para as chamadas S2S funcionarem (catalog-service no Docker, catalog.gamerent.internal na AWS).
     for base, service in ((CATALOG, "catalog-service"), (RENTAL, "rental-service")):
-        status, disc = req(f"{base}/discovery")
-        assert status == 200 and disc["service"] == service
+        disc = wait_discovery(base)
+        assert disc["service"] == service
         check("node", disc["node_urn"])
         assert set(disc["urn_schema"]) == {"node", "game", "rental", "owner"}
         for entry in disc["dns"]:
