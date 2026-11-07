@@ -449,7 +449,7 @@ def update_game_status(
     """
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
-    logger.info(f"[LAMPORT={clock}] Atualização de status do jogo ID={game_id} para {payload.status}")
+    logger.info(f"[LAMPORT={clock}] Atualização de status do jogo ID={game_id} para {payload.status.value}")
 
     with _lock:
         if game_id not in GAMES_DB:
@@ -463,10 +463,10 @@ def update_game_status(
             (game.status == GameStatus.RENTED and payload.status != GameStatus.AVAILABLE)
             or (game.status == GameStatus.MAINTENANCE and payload.status == GameStatus.RENTED)
         ):
-            logger.warning(f"[LAMPORT={clock}] Conflito 409: tentativa de alterar jogo ID={game_id} de {game.status} para {payload.status}")
+            logger.warning(f"[LAMPORT={clock}] Conflito 409: tentativa de alterar jogo ID={game_id} de {game.status.value} para {payload.status.value}")
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Transição inválida de '{game.status}' para '{payload.status}' no jogo '{game.title}'."
+                detail=f"Transição inválida de '{game.status.value}' para '{payload.status.value}' no jogo '{game.title}'."
             )
 
         game.status = payload.status
@@ -508,10 +508,10 @@ def reserve_game(
             return _save_game(game)
 
         if game.status != GameStatus.AVAILABLE:
-            logger.warning(f"[LAMPORT={clock}] Conflito 409: Jogo ID={game_id} indisponível para reserva (status atual: {game.status})")
+            logger.warning(f"[LAMPORT={clock}] Conflito 409: Jogo ID={game_id} indisponível para reserva (status atual: {game.status.value})")
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"O jogo '{game.title}' não está disponível para reserva no momento (status atual: {game.status})."
+                detail=f"O jogo '{game.title}' não está disponível para reserva no momento (status atual: {game.status.value})."
             )
 
         prev_status = game.status
