@@ -3,7 +3,6 @@ import os
 import socket
 import threading
 import time
-import urllib.parse
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional
@@ -25,8 +24,12 @@ from models import (
     StatusUpdatePayload,
 )
 from geo_utils import calculate_haversine_distance
+import naming
 
-NODE_URN = f"urn:gamerent:node:catalog-service:{os.getenv('INSTANCE_ID') or socket.gethostname()}"
+SERVICE_NAME = "catalog-service"
+NODE_URN = naming.node_urn(SERVICE_NAME)
+# Nomes simbólicos deste nó: Route 53 / Cloud Map na AWS, aliases do Docker DNS localmente
+DNS_TARGETS = [t for t in os.getenv("DNS_DISCOVERY_TARGETS", f"catalog.{naming.INTERNAL_DOMAIN},catalog-service").split(",") if t]
 
 # Configuração de Logs
 logging.basicConfig(
@@ -53,9 +56,8 @@ app.add_middleware(
 _lock = threading.Lock()
 _lamport_clock = 0
 
-INSTANCE_ID = os.getenv("INSTANCE_ID", os.getenv("HOSTNAME", "node-catalog-01"))
-NODE_URN = f"urn:gamerent:node:catalog-service:{INSTANCE_ID}"
-DNS_TARGET = os.getenv("DNS_DISCOVERY_TARGET", "catalog.gamerent.internal")
+INSTANCE_ID = naming.instance_id()
+DNS_TARGET = os.getenv("DNS_DISCOVERY_TARGET", DNS_TARGETS[0])
 
 
 def tick_lamport(incoming: Optional[int] = None) -> int:
@@ -66,27 +68,14 @@ def tick_lamport(incoming: Optional[int] = None) -> int:
 
 
 def _resolve_dns(target: str) -> DNSResolutionInfo:
-    try:
-        host = target
-        if "://" in host:
-            host = urllib.parse.urlparse(host).hostname or host
-        if ":" in host:
-            host = host.split(":")[0]
-
-        addr_info = socket.getaddrinfo(host, None)
-        ips = list(dict.fromkeys([item[4][0] for item in addr_info]))
-        return DNSResolutionInfo(
-            target_hostname=host,
-            resolved_ips=ips,
-            status="RESOLVED"
-        )
-    except Exception as exc:
-        return DNSResolutionInfo(
-            target_hostname=target,
-            resolved_ips=[],
-            status="UNRESOLVED",
-            error_message=str(exc)
-        )
+    """Resolução via naming.resolve (timeout e log [DNS]) no formato DNSResolutionInfo."""
+    r = naming.resolve(target)
+    return DNSResolutionInfo(
+        target_hostname=r["hostname"],
+        resolved_ips=r["resolved_ips"],
+        status=r["status"],
+        error_message=r["error"],
+    )
 
 
 def _get_dynamodb_status() -> DynamoDBStatusInfo:
@@ -320,6 +309,16 @@ def health_check(
     }
 
 
+def log_dns_resolution():
+    logger.info(f"Nó {NODE_URN} iniciado")
+    for target in DNS_TARGETS:
+        naming.resolve(target)
+
+
+# Executa uma vez ao carregar o módulo (antes de o uvicorn aceitar conexões)
+log_dns_resolution()
+
+
 @app.get("/discovery", response_model=DiscoveryResponse, tags=["Observabilidade"])
 def get_discovery(
     response: Response,
@@ -331,26 +330,19 @@ def get_discovery(
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
 
-    hostname = socket.gethostname()
-    try:
-        local_ip = socket.gethostbyname(hostname)
-    except Exception:
-        local_ip = "127.0.0.1"
-
-    dns_info = _resolve_dns(DNS_TARGET)
-    ddb_info = _get_dynamodb_status()
-
+    extras = naming.naming_extras(DNS_TARGETS)
     return DiscoveryResponse(
         service="catalog-service",
         node_urn=NODE_URN,
         instance_id=INSTANCE_ID,
-        hostname=hostname,
-        local_ip=local_ip,
+        hostname=socket.gethostname(),
+        local_ip=(extras["local_ips"] or ["127.0.0.1"])[0],
         dns_target=DNS_TARGET,
-        dns_resolution=dns_info,
+        dns_resolution=_resolve_dns(DNS_TARGET),
         lamport_clock=clock,
-        dynamodb=ddb_info,
-        timestamp=datetime.now(timezone.utc).isoformat()
+        dynamodb=_get_dynamodb_status(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        **extras,
     )
 
 

@@ -3,6 +3,8 @@ from enum import Enum
 from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
+import naming
+
 ConsistencyMode = Literal["strong", "eventual"]
 
 
@@ -53,9 +55,9 @@ class _GameBase(BaseModel):
 
     def model_post_init(self, __context) -> None:
         if not self.urn:
-            self.urn = f"urn:gamerent:game:sa-east-1:{self.id}"
+            self.urn = naming.game_urn(self.id)
         if not self.owner_urn:
-            self.owner_urn = f"urn:gamerent:owner:{self.owner_id}"
+            self.owner_urn = naming.owner_urn(self.owner_id)
 
 
 class GamePublicResponse(_GameBase):
@@ -102,3 +104,9 @@ class DiscoveryResponse(BaseModel):
     lamport_clock: int
     dynamodb: DynamoDBStatusInfo
     timestamp: str
+    # Esquema formal de nomeação (issue #5)
+    region: Optional[str] = None
+    local_ips: List[str] = Field(default_factory=list)
+    internal_domain: Optional[str] = None
+    dns: List[dict] = Field(default_factory=list)
+    urn_schema: dict = Field(default_factory=dict)
