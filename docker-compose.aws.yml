@@ -3,8 +3,8 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
 #
-# Para os nomes simbólicos da AWS (Route 53 / Cloud Map), troque CATALOG_SERVICE_URL por
-# http://catalog.gamerent.internal:8001 depois de provisionar a zona privada (issue #5).
+# CATALOG_SERVICE_URL usa o nome simbólico do Route 53 (issue #5). Provisione a zona privada
+# com infra/setup_route53.sh antes de subir a stack na EC2.
 
 x-aws-managed: &aws-managed
   USE_DYNAMODB: "true"
@@ -24,3 +24,4 @@ services:
   rental-service:
     environment:
       <<: *aws-managed
+      CATALOG_SERVICE_URL: "http://catalog.gamerent.internal:8001"
