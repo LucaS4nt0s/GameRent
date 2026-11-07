@@ -7,6 +7,13 @@ const STATUS_LABEL = {
   MAINTENANCE: 'Manutenção',
 }
 
+const SP_NEIGHBORHOODS = [
+  { name: 'Centro', lat: -23.5505, lon: -46.6333 },
+  { name: 'Av. Paulista', lat: -23.5615, lon: -46.656 },
+  { name: 'Itaim Bibi', lat: -23.5874, lon: -46.6795 },
+  { name: 'Pinheiros', lat: -23.567, lon: -46.691 },
+]
+
 const THUMBS = [
   'linear-gradient(135deg,#00A650,#00D26A)',
   'linear-gradient(135deg,#0B7A3B,#12B76A)',
@@ -16,46 +23,93 @@ const THUMBS = [
   'linear-gradient(135deg,#0F766E,#2DD4BF)',
 ]
 
-function initials(title) {
-  return title
+const DEFAULT_SEARCH = {
+  lat: String(SP_NEIGHBORHOODS[0].lat),
+  lon: String(SP_NEIGHBORHOODS[0].lon),
+  maxKm: '10',
+}
+
+const DEFAULT_OWNER_FORM = {
+  title: '',
+  description: '',
+  category: '',
+  price_per_day: '',
+  owner_id: '',
+  owner_name: '',
+  latitude: String(SP_NEIGHBORHOODS[0].lat),
+  longitude: String(SP_NEIGHBORHOODS[0].lon),
+}
+
+function initials(title = '') {
+  return String(title)
     .replace(/[^\p{L}\p{N} ]/gu, '')
     .split(/\s+/)
     .filter(Boolean)
     .slice(0, 2)
-    .map((w) => w[0].toUpperCase())
-    .join('')
+    .map((word) => word[0].toUpperCase())
+    .join('') || 'GR'
+}
+
+function money(value) {
+  return Number(value || 0).toFixed(2)
+}
+
+function modeLabel(mode) {
+  return mode === 'eventual' ? 'Eventual' : 'Forte'
+}
+
+function shortError(value) {
+  if (!value) return ''
+  return typeof value === 'string' ? value : JSON.stringify(value)
 }
 
 export default function App() {
-  const [tab, setTab] = useState('home')
-  const [games, setGames] = useState([])
-  const [rentals, setRentals] = useState([])
+  const [tab, setTab] = useState('renter')
   const [health, setHealth] = useState({ catalog: null, rental: null })
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const [loading, setLoading] = useState(false)
 
-  const [query, setQuery] = useState('')
-  const [category, setCategory] = useState('Todas')
-
-  const [nearby, setNearby] = useState(null)
+  const [consistency, setConsistency] = useState('strong')
+  const [textQuery, setTextQuery] = useState('')
+  const [search, setSearch] = useState(DEFAULT_SEARCH)
+  const [nearby, setNearby] = useState({ items: [], meta: null })
   const [locating, setLocating] = useState(false)
 
+  const [rentals, setRentals] = useState([])
+  const [renterEmailFilter, setRenterEmailFilter] = useState('')
   const [renting, setRenting] = useState(null)
   const [form, setForm] = useState({ renter_name: '', renter_email: '', rental_days: '1' })
 
-  const categories = useMemo(() => {
-    const set = new Set(games.map((g) => g.category))
-    return ['Todas', ...set]
-  }, [games])
+  const [ownerForm, setOwnerForm] = useState(DEFAULT_OWNER_FORM)
+  const [ownerFilter, setOwnerFilter] = useState('')
+  const [ownerGames, setOwnerGames] = useState([])
+  const [ownerMeta, setOwnerMeta] = useState(null)
 
-  const filtered = useMemo(() => {
-    return games.filter((g) => {
-      const byCat = category === 'Todas' || g.category === category
-      const byText = g.title.toLowerCase().includes(query.trim().toLowerCase())
-      return byCat && byText
-    })
-  }, [games, category, query])
+  const [discovery, setDiscovery] = useState({ catalog: null, rental: null, errors: {} })
+  const [loadingDiscovery, setLoadingDiscovery] = useState(false)
+
+  const [labGameId, setLabGameId] = useState('')
+  const [simRunning, setSimRunning] = useState(false)
+  const [simResults, setSimResults] = useState([])
+
+  const [benchRunning, setBenchRunning] = useState(false)
+  const [benchmark, setBenchmark] = useState(null)
+
+  const availableGames = useMemo(
+    () => nearby.items.filter((game) => game.status === 'AVAILABLE'),
+    [nearby.items]
+  )
+
+  const renterGames = useMemo(() => {
+    const term = textQuery.trim().toLowerCase()
+    if (!term) return nearby.items
+    return nearby.items.filter((game) =>
+      `${game.title} ${game.category} ${game.owner_name}`.toLowerCase().includes(term)
+    )
+  }, [nearby.items, textQuery])
+
+  const serviceUp = health.catalog === 'HEALTHY' && health.rental === 'HEALTHY'
 
   async function run(fn) {
     setError('')
@@ -63,8 +117,8 @@ export default function App() {
     setLoading(true)
     try {
       return await fn()
-    } catch (e) {
-      setError(e.message)
+    } catch (err) {
+      setError(err.message)
       return null
     } finally {
       setLoading(false)
@@ -72,88 +126,113 @@ export default function App() {
   }
 
   async function loadHealth() {
-    try {
-      const data = await api.catalog.health()
-      setHealth((h) => ({ ...h, catalog: data.status }))
-    } catch {
-      setHealth((h) => ({ ...h, catalog: 'DOWN' }))
-    }
-    try {
-      const data = await api.rental.health()
-      setHealth((h) => ({ ...h, rental: data.status }))
-    } catch {
-      setHealth((h) => ({ ...h, rental: 'DOWN' }))
-    }
+    const [catalog, rental] = await Promise.allSettled([
+      api.catalog.health(),
+      api.rental.health(),
+    ])
+    setHealth({
+      catalog: catalog.status === 'fulfilled' ? catalog.value.status : 'DOWN',
+      rental: rental.status === 'fulfilled' ? rental.value.status : 'DOWN',
+    })
   }
 
-  async function loadGames() {
-    const data = await run(() => api.catalog.listGames())
-    if (data) setGames(data)
+  async function loadNearby(options = {}) {
+    const lat = options.lat ?? search.lat
+    const lon = options.lon ?? search.lon
+    const maxKm = options.maxKm ?? search.maxKm
+    const mode = options.consistency ?? consistency
+    const data = await api.catalog.nearby({ lat, lon, maxKm, consistency: mode })
+    setNearby(data)
+    return data
   }
 
-  async function loadRentals() {
-    const data = await run(() => api.rental.listRentals())
-    if (data) setRentals(data)
+  async function loadRentals(email = renterEmailFilter) {
+    const data = await api.rental.listRentals({ renterEmail: email.trim() || undefined })
+    setRentals(data.items)
+    return data
+  }
+
+  async function loadOwnerGames(ownerId = ownerFilter, mode = consistency) {
+    const data = await api.catalog.listGames({
+      consistency: mode,
+      ownerId: ownerId.trim() || undefined,
+    })
+    setOwnerGames(data.items)
+    setOwnerMeta(data.meta)
+    return data
+  }
+
+  async function refreshCatalog(mode = consistency) {
+    const [near, owner] = await Promise.allSettled([
+      loadNearby({ consistency: mode }),
+      loadOwnerGames(ownerFilter, mode),
+    ])
+    if (near.status === 'rejected') throw near.reason
+    if (owner.status === 'rejected') throw owner.reason
   }
 
   useEffect(() => {
-    loadHealth()
-    loadGames()
-    loadRentals()
+    let active = true
+    async function boot() {
+      setLoading(true)
+      try {
+        const [near, rentalsData, ownerData] = await Promise.all([
+          api.catalog.nearby({
+            lat: DEFAULT_SEARCH.lat,
+            lon: DEFAULT_SEARCH.lon,
+            maxKm: DEFAULT_SEARCH.maxKm,
+            consistency: 'strong',
+          }),
+          api.rental.listRentals(),
+          api.catalog.listGames({ consistency: 'strong' }),
+        ])
+        if (!active) return
+        setNearby(near)
+        setRentals(rentalsData.items)
+        setOwnerGames(ownerData.items)
+        setOwnerMeta(ownerData.meta)
+      } catch (err) {
+        if (active) setError(err.message)
+      } finally {
+        if (active) setLoading(false)
+      }
+      loadHealth()
+    }
+    boot()
+    return () => {
+      active = false
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  function openRent(game) {
-    setRenting(game)
-    setForm({ renter_name: '', renter_email: '', rental_days: '1' })
-    setError('')
-    setMessage('')
+  async function searchNearby(coords) {
+    const next = coords
+      ? {
+          lat: String(coords.lat),
+          lon: String(coords.lon),
+          maxKm: coords.maxKm ?? search.maxKm,
+        }
+      : search
+    if (coords) setSearch(next)
+    await run(async () => {
+      await loadNearby({ ...next, consistency })
+      setMessage(`Busca concluída com consistência ${modeLabel(consistency)}.`)
+    })
   }
 
-  async function submitRental(e) {
-    e.preventDefault()
-    const payload = {
-      game_id: renting.id,
-      renter_name: form.renter_name,
-      renter_email: form.renter_email,
-      rental_days: Number(form.rental_days),
-    }
-    const data = await run(() => api.rental.createRental(payload))
-    if (data) {
-      setRenting(null)
-      setMessage(`Pedido confirmado! "${data.game_title}" por ${data.rental_days} dia(s) — R$ ${data.total_price.toFixed(2)}`)
-      setTab('orders')
-      loadGames()
-      loadRentals()
-    }
-  }
-
-  async function doReturn(id) {
-    const data = await run(() => api.rental.returnRental(id))
-    if (data) {
-      setMessage('Devolução registrada. Jogo liberado no catálogo.')
-      loadGames()
-      loadRentals()
-    }
-  }
-
-  async function searchNearby() {
-    setLocating(true)
-    setError('')
+  async function useMyLocation() {
     if (!navigator.geolocation) {
       setError('Geolocalização não é suportada neste navegador.')
-      setLocating(false)
       return
     }
+    setLocating(true)
     navigator.geolocation.getCurrentPosition(
-      async (pos) => {
-        const lat = pos.coords.latitude
-        const lon = pos.coords.longitude
-        const data = await run(() => api.catalog.nearby(lat, lon, 50))
-        if (data) {
-          setNearby(data)
-          setTab('nearby')
+      async (position) => {
+        const coords = {
+          lat: position.coords.latitude,
+          lon: position.coords.longitude,
         }
+        await searchNearby(coords)
         setLocating(false)
       },
       (err) => {
@@ -163,7 +242,184 @@ export default function App() {
     )
   }
 
-  const serviceUp = health.catalog === 'HEALTHY' && health.rental === 'HEALTHY'
+  function openRent(game) {
+    setRenting(game)
+    setForm({ renter_name: '', renter_email: '', rental_days: '1' })
+    setError('')
+    setMessage('')
+  }
+
+  async function submitRental(event) {
+    event.preventDefault()
+    const data = await run(() =>
+      api.rental.createRental({
+        game_id: renting.id,
+        renter_name: form.renter_name,
+        renter_email: form.renter_email,
+        rental_days: Number(form.rental_days),
+      })
+    )
+    if (!data) return
+    setRenting(null)
+    const success =
+      `Locação confirmada: "${data.game_title}" por ${data.rental_days} dia(s) — R$ ${money(
+        data.total_price
+      )}. Lamport ${data.lamport_clock}.`
+    await run(async () => {
+      await refreshCatalog()
+      await loadRentals()
+    })
+    setMessage(success)
+  }
+
+  async function doReturn(id) {
+    const data = await run(() => api.rental.returnRental(id))
+    if (!data) return
+    const success = `Devolução registrada. Jogo liberado no catálogo (Lamport ${data.lamport_clock}).`
+    await run(refreshCatalog)
+    setMessage(success)
+  }
+
+  async function submitGame(event) {
+    event.preventDefault()
+    const payload = {
+      title: ownerForm.title.trim(),
+      description: ownerForm.description.trim(),
+      category: ownerForm.category.trim(),
+      price_per_day: Number(ownerForm.price_per_day),
+      owner_id: ownerForm.owner_id.trim(),
+      owner_name: ownerForm.owner_name.trim(),
+      latitude: Number(ownerForm.latitude),
+      longitude: Number(ownerForm.longitude),
+    }
+    const data = await run(() => api.catalog.createGame(payload))
+    if (!data) return
+    const success = `Jogo cadastrado com URN ${data.urn} (versão ${data.version}).`
+    setOwnerForm((current) => ({
+      ...DEFAULT_OWNER_FORM,
+      owner_id: current.owner_id,
+      owner_name: current.owner_name,
+      latitude: current.latitude,
+      longitude: current.longitude,
+    }))
+    await run(async () => {
+      await loadOwnerGames()
+      await loadNearby()
+      setLabGameId(String(data.id))
+    })
+    setMessage(success)
+  }
+
+  async function toggleGameStatus(game) {
+    if (game.status === 'RENTED') {
+      setError('Um jogo alugado só pode voltar a DISPONÍVEL após a devolução da locação.')
+      return
+    }
+    const nextStatus = game.status === 'MAINTENANCE' ? 'AVAILABLE' : 'MAINTENANCE'
+    const data = await run(() => api.catalog.updateStatus(game.id, nextStatus))
+    if (!data) return
+    const success = `Status de "${data.title}" alterado para ${STATUS_LABEL[data.status]} (v${data.version}).`
+    await run(async () => {
+      await loadOwnerGames()
+      await loadNearby()
+    })
+    setMessage(success)
+  }
+
+  async function refreshDiscovery() {
+    setLoadingDiscovery(true)
+    setError('')
+    const errors = {}
+    const [catalog, rental] = await Promise.allSettled([
+      api.catalog.discovery(),
+      api.rental.discovery(),
+    ])
+    if (catalog.status === 'rejected') errors.catalog = catalog.reason.message
+    if (rental.status === 'rejected') errors.rental = rental.reason.message
+    setDiscovery({
+      catalog: catalog.status === 'fulfilled' ? catalog.value : null,
+      rental: rental.status === 'fulfilled' ? rental.value : null,
+      errors,
+    })
+    setLoadingDiscovery(false)
+  }
+
+  async function runDoubleBooking() {
+    const selected = nearby.items.find((game) => String(game.id) === String(labGameId))
+    const game = selected && selected.status === 'AVAILABLE' ? selected : availableGames[0]
+    if (!game) {
+      setError('Nenhum jogo disponível para simular. Cadastre ou devolva um jogo primeiro.')
+      return
+    }
+
+    setError('')
+    setMessage('')
+    setSimRunning(true)
+    setSimResults([])
+    setLabGameId(String(game.id))
+
+    try {
+      const requests = Array.from({ length: 10 }, (_, index) =>
+        api.rental.createRentalRaw({
+          game_id: game.id,
+          renter_name: `Locatário Simultâneo ${index + 1}`,
+          renter_email: `simulador${index + 1}@gamerent.test`,
+          rental_days: 1,
+        })
+      )
+      const responses = await Promise.all(requests)
+      setSimResults(
+        responses.map((response, index) => ({
+          index: index + 1,
+          gameTitle: game.title,
+          ...response,
+        }))
+      )
+      setMessage(`Simulação concluída para "${game.title}".`)
+      await loadNearby()
+      await loadRentals()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setSimRunning(false)
+    }
+  }
+
+  async function runBenchmark() {
+    setBenchRunning(true)
+    setError('')
+    setMessage('')
+    try {
+      async function sample(mode) {
+        const runs = []
+        for (let index = 0; index < 5; index += 1) {
+          const startedAt = performance.now()
+          const data = await api.catalog.listGames({ consistency: mode })
+          const elapsed = performance.now() - startedAt
+          runs.push({
+            latency: data.meta.db_read_latency_ms ?? elapsed,
+            served_by_node: data.meta.served_by_node,
+            games: data.items.length,
+          })
+        }
+        const total = runs.reduce((sum, item) => sum + item.latency, 0)
+        return {
+          mode,
+          runs,
+          avg: total / runs.length,
+          served_by_node: runs[0]?.served_by_node || '',
+        }
+      }
+
+      const strong = await sample('strong')
+      const eventual = await sample('eventual')
+      setBenchmark({ strong, eventual })
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBenchRunning(false)
+    }
+  }
 
   return (
     <div className="app">
@@ -173,17 +429,17 @@ export default function App() {
             <span className="logo">GR</span>
             <div>
               <strong>GameRent</strong>
-              <span className="tagline">alugue jogos perto de você</span>
+              <span className="tagline">alugue jogos de tabuleiro perto de você</span>
             </div>
           </div>
-          <label className="search">
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Buscar jogo pelo nome…"
+          <div className="topbar-status">
+            <span className="topbar-label">Consistência</span>
+            <span className={`mode-badge ${consistency}`}>{modeLabel(consistency)}</span>
+            <span
+              className={`pulse ${serviceUp ? 'ok' : 'down'}`}
+              title={serviceUp ? 'Serviços online' : 'Serviço indisponível'}
             />
-          </label>
-          <span className={`pulse ${serviceUp ? 'ok' : 'down'}`} title={serviceUp ? 'Serviços online' : 'Serviço indisponível'} />
+          </div>
         </div>
       </header>
 
@@ -192,169 +448,612 @@ export default function App() {
         {message && <div className="alert success">{message}</div>}
         {loading && <div className="alert info">Carregando…</div>}
 
-        {tab === 'home' && (
-          <>
-            <section className="hero">
-              <div>
-                <h1>Jogos de tabuleiro a um toque</h1>
-                <p>Os melhores títulos do seu bairro, alugados por dia.</p>
-              </div>
-              <button className="cta" onClick={searchNearby} disabled={locating}>
-                {locating ? 'Buscando…' : 'Jogos perto de mim'}
-              </button>
-            </section>
-
-            <div className="chips">
-              {categories.map((c) => (
-                <button
-                  key={c}
-                  className={category === c ? 'chip active' : 'chip'}
-                  onClick={() => setCategory(c)}
-                >
-                  {c}
-                </button>
-              ))}
-            </div>
-
-            <h2 className="section-title">
-              {query ? `Resultados para "${query}"` : 'Destaques'}
-              <span className="count">{filtered.length}</span>
-            </h2>
-
-            <div className="grid">
-              {filtered.map((g, i) => (
-                <GameCard key={g.id} game={g} thumb={THUMBS[i % THUMBS.length]} onRent={openRent} />
-              ))}
-              {filtered.length === 0 && <p className="empty">Nenhum jogo encontrado.</p>}
-            </div>
-          </>
+        {tab === 'renter' && (
+          <RenterTab
+            search={search}
+            setSearch={setSearch}
+            consistency={consistency}
+            setConsistency={setConsistency}
+            onSearch={() => searchNearby()}
+            onPickNeighborhood={(neighborhood) =>
+              searchNearby({ lat: neighborhood.lat, lon: neighborhood.lon })
+            }
+            onUseMyLocation={useMyLocation}
+            locating={locating}
+            meta={nearby.meta}
+            games={renterGames}
+            total={nearby.items.length}
+            textQuery={textQuery}
+            setTextQuery={setTextQuery}
+            onRent={openRent}
+            rentals={rentals}
+            renterEmailFilter={renterEmailFilter}
+            setRenterEmailFilter={setRenterEmailFilter}
+            onFilterRentals={async () => run(() => loadRentals())}
+            onReturn={doReturn}
+          />
         )}
 
-        {tab === 'nearby' && (
-          <>
-            <h2 className="section-title">Perto de você {nearby && <span className="count">{nearby.length}</span>}</h2>
-            <button className="cta wide" onClick={searchNearby} disabled={locating}>
-              {locating ? 'Buscando…' : 'Usar minha localização'}
-            </button>
-            <div className="grid">
-              {nearby &&
-                nearby.map((g, i) => (
-                  <article className="card" key={g.id}>
-                    <div className="thumb" style={{ background: THUMBS[i % THUMBS.length] }}>
-                      <span>{initials(g.title)}</span>
-                      <span className="distance">{g.distance_km} km</span>
-                    </div>
-                    <div className="card-body">
-                      <div className="card-top">
-                        <h3>{g.title}</h3>
-                        <StatusPill status={g.status} />
-                      </div>
-                      <p className="muted">{g.category}</p>
-                      <div className="card-foot">
-                        <span className="price">R$ {g.price_per_day.toFixed(2)}<small>/dia</small></span>
-                        <button onClick={() => openRent(g)} disabled={g.status !== 'AVAILABLE'}>
-                          Alugar
-                        </button>
-                      </div>
-                    </div>
-                  </article>
-                ))}
-              {nearby && nearby.length === 0 && <p className="empty">Nenhum jogo num raio de 50 km.</p>}
-              {!nearby && <p className="empty">Toque em "Usar minha localização" para ver jogos por perto.</p>}
-            </div>
-          </>
+        {tab === 'owner' && (
+          <OwnerTab
+            form={ownerForm}
+            setForm={setOwnerForm}
+            onSubmit={submitGame}
+            onPickNeighborhood={(neighborhood) =>
+              setOwnerForm((current) => ({
+                ...current,
+                latitude: String(neighborhood.lat),
+                longitude: String(neighborhood.lon),
+              }))
+            }
+            games={ownerGames}
+            meta={ownerMeta}
+            ownerFilter={ownerFilter}
+            setOwnerFilter={setOwnerFilter}
+            onFilter={async () => run(() => loadOwnerGames())}
+            onToggleStatus={toggleGameStatus}
+            consistency={consistency}
+          />
         )}
 
-        {tab === 'orders' && (
-          <>
-            <h2 className="section-title">Meus pedidos <span className="count">{rentals.length}</span></h2>
-            <div className="orders">
-              {rentals.map((r) => (
-                <article className="order" key={r.rental_id}>
-                  <div className="order-thumb">{initials(r.game_title)}</div>
-                  <div className="order-info">
-                    <strong>{r.game_title}</strong>
-                    <span className="muted">{r.rental_days} dia(s) · {r.renter_name}</span>
-                    <span className="muted mono">{r.rental_id.slice(0, 8)}</span>
-                  </div>
-                  <div className="order-right">
-                    <span className="price">R$ {r.total_price.toFixed(2)}</span>
-                    <span className={`status-text ${r.status}`}>{r.status}</span>
-                    {r.status === 'CONFIRMED' && (
-                      <button className="ghost" onClick={() => doReturn(r.rental_id)}>Devolver</button>
-                    )}
-                  </div>
-                </article>
-              ))}
-              {rentals.length === 0 && <p className="empty">Você ainda não fez nenhum pedido.</p>}
-            </div>
-          </>
+        {tab === 'lab' && (
+          <LabTab
+            games={nearby.items}
+            labGameId={labGameId}
+            setLabGameId={setLabGameId}
+            simRunning={simRunning}
+            simResults={simResults}
+            onRunSimulation={runDoubleBooking}
+            discovery={discovery}
+            loadingDiscovery={loadingDiscovery}
+            onRefreshDiscovery={refreshDiscovery}
+            benchmark={benchmark}
+            benchRunning={benchRunning}
+            onRunBenchmark={runBenchmark}
+            consistency={consistency}
+          />
         )}
       </main>
 
       <nav className="bottom-nav">
-        <NavItem id="home" tab={tab} setTab={setTab} label="Início">
+        <NavItem id="renter" tab={tab} setTab={setTab} label="Locatário">
           <svg viewBox="0 0 24 24"><path d="M3 10.5 12 3l9 7.5V21H3z" /></svg>
         </NavItem>
-        <NavItem id="nearby" tab={tab} setTab={setTab} label="Perto">
-          <svg viewBox="0 0 24 24"><path d="M12 2a7 7 0 0 0-7 7c0 5 7 13 7 13s7-8 7-13a7 7 0 0 0-7-7zm0 9.5A2.5 2.5 0 1 1 12 6a2.5 2.5 0 0 1 0 5.5z" /></svg>
-        </NavItem>
-        <NavItem id="orders" tab={tab} setTab={setTab} label="Pedidos">
+        <NavItem id="owner" tab={tab} setTab={setTab} label="Locador">
           <svg viewBox="0 0 24 24"><path d="M4 4h16v3H4zM5 9h14l-1 11H6z" /></svg>
+        </NavItem>
+        <NavItem id="lab" tab={tab} setTab={setTab} label="Laboratório">
+          <svg viewBox="0 0 24 24"><path d="M9 2h6v3l4 9v5a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3v-5l4-9zM8 15h8" /></svg>
         </NavItem>
       </nav>
 
       {renting && (
-        <div className="overlay" onClick={() => setRenting(null)}>
-          <div className="sheet" onClick={(e) => e.stopPropagation()}>
-            <div className="sheet-thumb" style={{ background: THUMBS[renting.id % THUMBS.length] }}>
-              <span>{initials(renting.title)}</span>
-            </div>
-            <h3>{renting.title}</h3>
-            <p className="muted">
-              {renting.category} · R$ {renting.price_per_day.toFixed(2)}/dia
-            </p>
-            <form onSubmit={submitRental} className="sheet-form">
-              <label>
-                Seu nome
-                <input
-                  value={form.renter_name}
-                  onChange={(e) => setForm({ ...form, renter_name: e.target.value })}
-                  placeholder="João da Silva"
-                  required
-                />
-              </label>
-              <label>
-                E-mail
-                <input
-                  type="email"
-                  value={form.renter_email}
-                  onChange={(e) => setForm({ ...form, renter_email: e.target.value })}
-                  placeholder="joao@exemplo.com"
-                  required
-                />
-              </label>
-              <label>
-                Dias
-                <input
-                  type="number"
-                  min="1"
-                  value={form.rental_days}
-                  onChange={(e) => setForm({ ...form, rental_days: e.target.value })}
-                  required
-                />
-              </label>
-              <div className="sheet-total">
-                Total estimado
-                <strong>R$ {(renting.price_per_day * Number(form.rental_days || 0)).toFixed(2)}</strong>
-              </div>
-              <button className="cta wide" type="submit">Confirmar aluguel</button>
-              <button className="ghost wide" type="button" onClick={() => setRenting(null)}>Cancelar</button>
-            </form>
-          </div>
-        </div>
+        <RentModal
+          game={renting}
+          form={form}
+          setForm={setForm}
+          onClose={() => setRenting(null)}
+          onSubmit={submitRental}
+        />
       )}
     </div>
+  )
+}
+
+function RenterTab({
+  search,
+  setSearch,
+  consistency,
+  setConsistency,
+  onSearch,
+  onPickNeighborhood,
+  onUseMyLocation,
+  locating,
+  meta,
+  games,
+  total,
+  textQuery,
+  setTextQuery,
+  onRent,
+  rentals,
+  renterEmailFilter,
+  setRenterEmailFilter,
+  onFilterRentals,
+  onReturn,
+}) {
+  return (
+    <>
+      <section className="hero">
+        <div>
+          <span className="hero-kicker">Aba 1 · Visão do Locatário</span>
+          <h1>Encontre jogos por perto e alugue em segundos</h1>
+          <p>Busca geoespacial com privacidade de GPS, consistência configurável e devolução pela interface.</p>
+        </div>
+        <button className="cta" onClick={onUseMyLocation} disabled={locating}>
+          {locating ? 'Buscando…' : 'Usar meu GPS'}
+        </button>
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <h2>Busca geográfica</h2>
+            <p className="panel-sub">Escolha um bairro de São Paulo ou informe latitude/longitude.</p>
+          </div>
+          <span className="count">{total} jogo(s)</span>
+        </div>
+
+        <div className="quick-row">
+          {SP_NEIGHBORHOODS.map((neighborhood) => (
+            <button
+              key={neighborhood.name}
+              className="chip"
+              type="button"
+              onClick={() => onPickNeighborhood(neighborhood)}
+            >
+              {neighborhood.name}
+            </button>
+          ))}
+        </div>
+
+        <div className="form-grid search-grid">
+          <Field label="Latitude">
+            <input
+              type="number"
+              step="any"
+              value={search.lat}
+              onChange={(event) => setSearch({ ...search, lat: event.target.value })}
+            />
+          </Field>
+          <Field label="Longitude">
+            <input
+              type="number"
+              step="any"
+              value={search.lon}
+              onChange={(event) => setSearch({ ...search, lon: event.target.value })}
+            />
+          </Field>
+          <Field label="Raio máximo (km)">
+            <input
+              type="number"
+              min="0.1"
+              step="0.1"
+              value={search.maxKm}
+              onChange={(event) => setSearch({ ...search, maxKm: event.target.value })}
+            />
+          </Field>
+          <Field label="Modo de consistência">
+            <select
+              value={consistency}
+              onChange={(event) => setConsistency(event.target.value)}
+            >
+              <option value="strong">Forte (strong)</option>
+              <option value="eventual">Eventual (eventual)</option>
+            </select>
+          </Field>
+          <button className="cta solid" type="button" onClick={onSearch}>
+            Buscar jogos
+          </button>
+        </div>
+
+        <MetaBadges meta={meta} />
+      </section>
+
+      <section className="section-block">
+        <div className="section-head">
+          <h2 className="section-title">
+            Jogos próximos <span className="count">{games.length}</span>
+          </h2>
+          <label className="inline-search">
+            <input
+              value={textQuery}
+              onChange={(event) => setTextQuery(event.target.value)}
+              placeholder="Filtrar por título, categoria ou dono…"
+            />
+          </label>
+        </div>
+
+        <div className="grid">
+          {games.map((game, index) => (
+            <GameCard
+              key={game.id}
+              game={game}
+              thumb={THUMBS[index % THUMBS.length]}
+              onRent={onRent}
+            />
+          ))}
+          {games.length === 0 && (
+            <p className="empty">Nenhum jogo encontrado com os filtros atuais.</p>
+          )}
+        </div>
+      </section>
+
+      <section className="section-block">
+        <div className="section-head">
+          <h2 className="section-title">
+            Minhas locações <span className="count">{rentals.length}</span>
+          </h2>
+          <div className="inline-actions">
+            <input
+              value={renterEmailFilter}
+              onChange={(event) => setRenterEmailFilter(event.target.value)}
+              placeholder="Filtrar por e-mail"
+            />
+            <button className="ghost" type="button" onClick={onFilterRentals}>
+              Filtrar
+            </button>
+          </div>
+        </div>
+
+        <div className="orders">
+          {rentals.map((rental) => (
+            <article className="order" key={rental.rental_id}>
+              <div className="order-thumb">{initials(rental.game_title)}</div>
+              <div className="order-info">
+                <strong>{rental.game_title}</strong>
+                <span className="muted">
+                  {rental.rental_days} dia(s) · {rental.renter_name} · {rental.renter_email}
+                </span>
+                <span className="mono">URN {rental.urn}</span>
+                <span className="mono">Lamport {rental.lamport_clock}</span>
+              </div>
+              <div className="order-right">
+                <span className="price">R$ {money(rental.total_price)}</span>
+                <span className={`status-text ${rental.status}`}>{rental.status}</span>
+                {rental.status === 'CONFIRMED' && (
+                  <button className="ghost" type="button" onClick={() => onReturn(rental.rental_id)}>
+                    Devolver jogo
+                  </button>
+                )}
+              </div>
+            </article>
+          ))}
+          {rentals.length === 0 && (
+            <p className="empty">Você ainda não fez nenhuma locação.</p>
+          )}
+        </div>
+      </section>
+    </>
+  )
+}
+
+function OwnerTab({
+  form,
+  setForm,
+  onSubmit,
+  onPickNeighborhood,
+  games,
+  meta,
+  ownerFilter,
+  setOwnerFilter,
+  onFilter,
+  onToggleStatus,
+}) {
+  return (
+    <>
+      <section className="hero owner-hero">
+        <div>
+          <span className="hero-kicker">Aba 2 · Visão do Locador</span>
+          <h1>Cadastre jogos e gerencie seu acervo</h1>
+          <p>Publique novos títulos no catálogo e alterne entre disponível e manutenção.</p>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <h2>Cadastrar novo jogo de tabuleiro</h2>
+            <p className="panel-sub">As coordenadas são usadas apenas no servidor para calcular distâncias.</p>
+          </div>
+        </div>
+
+        <div className="privacy-note">
+          <strong>Privacidade geográfica</strong>
+          <p>
+            Latitude e longitude ficam restritas ao servidor. As respostas públicas do catálogo
+            nunca expõem as coordenadas reais do locador — apenas a distância relativa em km.
+          </p>
+        </div>
+
+        <form onSubmit={onSubmit} className="owner-form">
+          <div className="form-grid">
+            <Field label="Título">
+              <input
+                value={form.title}
+                onChange={(event) => setForm({ ...form, title: event.target.value })}
+                placeholder="Catan"
+                required
+              />
+            </Field>
+            <Field label="Categoria">
+              <input
+                value={form.category}
+                onChange={(event) => setForm({ ...form, category: event.target.value })}
+                placeholder="Estratégia"
+                required
+              />
+            </Field>
+            <Field label="Preço por dia (R$)">
+              <input
+                type="number"
+                min="0.01"
+                step="0.01"
+                value={form.price_per_day}
+                onChange={(event) => setForm({ ...form, price_per_day: event.target.value })}
+                placeholder="15.00"
+                required
+              />
+            </Field>
+            <Field label="Nome do locador">
+              <input
+                value={form.owner_name}
+                onChange={(event) => setForm({ ...form, owner_name: event.target.value })}
+                placeholder="Ana Paula"
+                required
+              />
+            </Field>
+            <Field label="ID do locador">
+              <input
+                value={form.owner_id}
+                onChange={(event) => setForm({ ...form, owner_id: event.target.value })}
+                placeholder="locador-001"
+                required
+              />
+            </Field>
+            <Field label="Latitude (GPS)">
+              <input
+                type="number"
+                step="any"
+                value={form.latitude}
+                onChange={(event) => setForm({ ...form, latitude: event.target.value })}
+                required
+              />
+            </Field>
+            <Field label="Longitude (GPS)">
+              <input
+                type="number"
+                step="any"
+                value={form.longitude}
+                onChange={(event) => setForm({ ...form, longitude: event.target.value })}
+                required
+              />
+            </Field>
+            <Field label="Descrição" wide>
+              <textarea
+                value={form.description}
+                onChange={(event) => setForm({ ...form, description: event.target.value })}
+                placeholder="Clássico jogo de negociação, comércio e colonização."
+                rows="3"
+                required
+              />
+            </Field>
+          </div>
+
+          <div className="quick-row">
+            <span className="quick-label">Preenchimento rápido:</span>
+            {SP_NEIGHBORHOODS.map((neighborhood) => (
+              <button
+                key={neighborhood.name}
+                className="chip"
+                type="button"
+                onClick={() => onPickNeighborhood(neighborhood)}
+              >
+                {neighborhood.name}
+              </button>
+            ))}
+          </div>
+
+          <button className="cta solid wide" type="submit">
+            Cadastrar jogo no catálogo
+          </button>
+        </form>
+      </section>
+
+      <section className="section-block">
+        <div className="section-head">
+          <h2 className="section-title">Acervo de jogos</h2>
+          <div className="inline-actions">
+            <input
+              value={ownerFilter}
+              onChange={(event) => setOwnerFilter(event.target.value)}
+              placeholder="Filtrar por owner_id"
+            />
+            <button className="ghost" type="button" onClick={onFilter}>
+              Filtrar acervo
+            </button>
+          </div>
+        </div>
+
+        <MetaBadges meta={meta} />
+
+        <div className="owner-list">
+          {games.map((game) => (
+            <article className="owner-item" key={game.id}>
+              <div className="owner-item-main">
+                <div className="owner-item-top">
+                  <h3>{game.title}</h3>
+                  <StatusPill status={game.status} />
+                </div>
+                <p className="muted">
+                  {game.category} · {game.owner_name} ({game.owner_id}) · R$ {money(game.price_per_day)}/dia
+                </p>
+                <p className="mono">
+                  URN {game.urn} · versão {game.version} · Lamport {game.lamport_clock}
+                </p>
+              </div>
+              <button
+                type="button"
+                className={game.status === 'MAINTENANCE' ? 'ghost' : 'danger'}
+                onClick={() => onToggleStatus(game)}
+                disabled={game.status === 'RENTED'}
+              >
+                {game.status === 'RENTED'
+                  ? 'Alugado'
+                  : game.status === 'MAINTENANCE'
+                    ? 'Voltar para disponível'
+                    : 'Colocar em manutenção'}
+              </button>
+            </article>
+          ))}
+          {games.length === 0 && <p className="empty">Nenhum jogo encontrado para este locador.</p>}
+        </div>
+      </section>
+    </>
+  )
+}
+
+function LabTab({
+  games,
+  labGameId,
+  setLabGameId,
+  simRunning,
+  simResults,
+  onRunSimulation,
+  discovery,
+  loadingDiscovery,
+  onRefreshDiscovery,
+  benchmark,
+  benchRunning,
+  onRunBenchmark,
+  consistency,
+}) {
+  const winners = simResults.filter((result) => result.status === 201).length
+  const conflicts = simResults.filter((result) => result.status === 409).length
+  const failures = simResults.filter((result) => result.status !== 201 && result.status !== 409).length
+  const selectedGame = games.find((game) => String(game.id) === String(labGameId))
+
+  return (
+    <>
+      <section className="hero lab-hero">
+        <div>
+          <span className="hero-kicker">Aba 3 · Laboratório de Sistemas Distribuídos</span>
+          <h1>Coordenação, nomeação e consistência ao vivo</h1>
+          <p>Execute a disputa concorrente, inspecione o service discovery e compare os modos de leitura.</p>
+        </div>
+        <button className="cta" onClick={onRefreshDiscovery} disabled={loadingDiscovery}>
+          {loadingDiscovery ? 'Atualizando…' : 'Atualizar discovery'}
+        </button>
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <h2>Simulador de disputa concorrente</h2>
+            <p className="panel-sub">
+              Dispara 10 reservas simultâneas para o mesmo jogo via Promise.all. A exclusão mútua
+              deve produzir 1 vencedor e 9 conflitos.
+            </p>
+          </div>
+          <span className="mode-badge neutral">{consistency === 'strong' ? 'Leitura forte' : 'Leitura eventual'}</span>
+        </div>
+
+        <div className="lab-controls">
+          <Field label="Jogo alvo">
+            <select value={labGameId} onChange={(event) => setLabGameId(event.target.value)}>
+              <option value="">Selecione um jogo disponível…</option>
+              {games.map((game) => (
+                <option key={game.id} value={game.id} disabled={game.status !== 'AVAILABLE'}>
+                  #{game.id} — {game.title} ({STATUS_LABEL[game.status] || game.status})
+                </option>
+              ))}
+            </select>
+          </Field>
+          <button className="cta solid" type="button" onClick={onRunSimulation} disabled={simRunning}>
+            {simRunning ? 'Disparando 10 reservas…' : 'Disparar 10 reservas simultâneas'}
+          </button>
+        </div>
+
+        {selectedGame && (
+          <p className="hint">
+            Alvo selecionado: <strong>#{selectedGame.id} {selectedGame.title}</strong> · URN{' '}
+            <span className="mono">{selectedGame.urn}</span>
+          </p>
+        )}
+
+        {simResults.length > 0 && (
+          <>
+            <div className="summary-row">
+              <span className="summary-chip success">{winners} × 201 Created</span>
+              <span className="summary-chip conflict">{conflicts} × 409 Conflict</span>
+              {failures > 0 && <span className="summary-chip failure">{failures} × outro erro</span>}
+            </div>
+            <div className="result-grid">
+              {simResults.map((result) => (
+                <article key={result.index} className={`result-card result-${result.status}`}>
+                  <div className="result-head">
+                    <strong>Requisição #{result.index}</strong>
+                    <span className="result-status">{result.status}</span>
+                  </div>
+                  <p className="result-body">
+                    {result.status === 201
+                      ? `Vencedora: ${result.body?.game_title} · locação ${String(
+                          result.body?.rental_id || ''
+                        ).slice(0, 8)}`
+                      : shortError(result.error) || 'Requisição bloqueada.'}
+                  </p>
+                  <span className="mono">Lamport {result.meta?.lamport_clock ?? '—'}</span>
+                </article>
+              ))}
+            </div>
+          </>
+        )}
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <h2>Nomeação e service discovery</h2>
+            <p className="panel-sub">
+              URNs dos nós ativos, hostname DNS, IP resolvido e relógio de Lamport atual.
+            </p>
+          </div>
+        </div>
+
+        <div className="discovery-grid">
+          <DiscoveryCard
+            title="catalog-service"
+            data={discovery.catalog}
+            error={discovery.errors.catalog}
+          />
+          <DiscoveryCard
+            title="rental-service"
+            data={discovery.rental}
+            error={discovery.errors.rental}
+          />
+        </div>
+        {!discovery.catalog && !discovery.rental && !loadingDiscovery && (
+          <p className="empty">Clique em "Atualizar discovery" para consultar os microsserviços.</p>
+        )}
+      </section>
+
+      <section className="panel">
+        <div className="panel-head">
+          <div>
+            <h2>Comparador visual de consistência</h2>
+            <p className="panel-sub">
+              Executa 5 leituras seguidas em cada modo e calcula a latência média de leitura do banco.
+            </p>
+          </div>
+        </div>
+
+        <button className="cta solid" type="button" onClick={onRunBenchmark} disabled={benchRunning}>
+          {benchRunning ? 'Executando leituras…' : 'Comparar Forte vs. Eventual'}
+        </button>
+
+        {benchmark && (
+          <div className="discovery-grid bench-grid">
+            <BenchmarkCard title="Consistência Forte" data={benchmark.strong} />
+            <BenchmarkCard title="Consistência Eventual" data={benchmark.eventual} />
+          </div>
+        )}
+        {benchmark && (
+          <p className="hint">
+            Diferença de latência média: <strong>{Math.abs(benchmark.strong.avg - benchmark.eventual.avg).toFixed(2)} ms</strong>
+            {' '}a favor da modalidade {benchmark.strong.avg <= benchmark.eventual.avg ? 'forte' : 'eventual'}.
+          </p>
+        )}
+      </section>
+    </>
   )
 }
 
@@ -363,22 +1062,197 @@ function GameCard({ game, thumb, onRent }) {
     <article className="card">
       <div className="thumb" style={{ background: thumb }}>
         <span>{initials(game.title)}</span>
+        {game.distance_km !== undefined && (
+          <span className="distance">{Number(game.distance_km).toFixed(2)} km</span>
+        )}
       </div>
       <div className="card-body">
         <div className="card-top">
           <h3>{game.title}</h3>
           <StatusPill status={game.status} />
         </div>
-        <p className="muted">{game.category} · {game.owner_name}</p>
+        <p className="muted">
+          {game.category} · {game.owner_name}
+        </p>
         <p className="desc">{game.description}</p>
+        <div className="card-meta">
+          <span className="mono" title={game.urn}>URN {game.urn}</span>
+          <span>v{game.version}</span>
+          <span>Lamport {game.lamport_clock}</span>
+        </div>
         <div className="card-foot">
-          <span className="price">R$ {game.price_per_day.toFixed(2)}<small>/dia</small></span>
-          <button onClick={() => onRent(game)} disabled={game.status !== 'AVAILABLE'}>
-            {game.status === 'AVAILABLE' ? 'Alugar' : 'Indisponível'}
+          <span className="price">
+            R$ {money(game.price_per_day)}
+            <small>/dia</small>
+          </span>
+          <button
+            type="button"
+            onClick={() => onRent(game)}
+            disabled={game.status !== 'AVAILABLE'}
+          >
+            {game.status === 'AVAILABLE' ? 'Alugar Agora' : 'Indisponível'}
           </button>
         </div>
       </div>
     </article>
+  )
+}
+
+function RentModal({ game, form, setForm, onClose, onSubmit }) {
+  return (
+    <div className="overlay" onClick={onClose}>
+      <div className="sheet" onClick={(event) => event.stopPropagation()}>
+        <div className="sheet-thumb" style={{ background: THUMBS[game.id % THUMBS.length] }}>
+          <span>{initials(game.title)}</span>
+        </div>
+        <h3>{game.title}</h3>
+        <p className="muted">
+          {game.category} · R$ {money(game.price_per_day)}/dia · URN{' '}
+          <span className="mono">{game.urn}</span>
+        </p>
+        <form onSubmit={onSubmit} className="sheet-form">
+          <label>
+            Seu nome
+            <input
+              value={form.renter_name}
+              onChange={(event) => setForm({ ...form, renter_name: event.target.value })}
+              placeholder="João da Silva"
+              required
+            />
+          </label>
+          <label>
+            E-mail
+            <input
+              type="email"
+              value={form.renter_email}
+              onChange={(event) => setForm({ ...form, renter_email: event.target.value })}
+              placeholder="joao@exemplo.com"
+              required
+            />
+          </label>
+          <label>
+            Dias
+            <input
+              type="number"
+              min="1"
+              value={form.rental_days}
+              onChange={(event) => setForm({ ...form, rental_days: event.target.value })}
+              required
+            />
+          </label>
+          <div className="sheet-total">
+            Total estimado
+            <strong>R$ {money(game.price_per_day * Number(form.rental_days || 0))}</strong>
+          </div>
+          <button className="cta solid wide" type="submit">
+            Confirmar aluguel
+          </button>
+          <button className="ghost wide" type="button" onClick={onClose}>
+            Cancelar
+          </button>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+function DiscoveryCard({ title, data, error }) {
+  if (error) {
+    return (
+      <article className="discovery-card">
+        <h3>{title}</h3>
+        <p className="alert error">{error}</p>
+      </article>
+    )
+  }
+  if (!data) {
+    return (
+      <article className="discovery-card">
+        <h3>{title}</h3>
+        <p className="empty">Sem dados de discovery.</p>
+      </article>
+    )
+  }
+  const ips = data.dns_resolution?.resolved_ips || []
+  return (
+    <article className="discovery-card">
+      <h3>{title}</h3>
+      <dl className="discovery-list">
+        <DlItem term="URN do nó" value={data.node_urn} mono />
+        <DlItem term="Instância" value={data.instance_id} mono />
+        <DlItem term="Hostname DNS" value={data.dns_target} mono />
+        <DlItem term="Resolução DNS" value={data.dns_resolution?.status} />
+        <DlItem term="IP resolvido" value={ips.length ? ips.join(', ') : '—'} mono />
+        <DlItem term="Relógio de Lamport" value={data.lamport_clock} />
+        <DlItem
+          term="DynamoDB"
+          value={
+            data.dynamodb
+              ? `${data.dynamodb.mode} · ${data.dynamodb.table_name}`
+              : '—'
+          }
+        />
+      </dl>
+    </article>
+  )
+}
+
+function BenchmarkCard({ title, data }) {
+  return (
+    <article className="discovery-card bench-card">
+      <div className="bench-head">
+        <h3>{title}</h3>
+        <span className={`mode-badge ${data.mode}`}>{modeLabel(data.mode)}</span>
+      </div>
+      <strong className="bench-value">{Number(data.avg).toFixed(2)} ms</strong>
+      <p className="muted">Média de {data.runs.length} leituras</p>
+      <p className="mono">served_by_node: {data.served_by_node || '—'}</p>
+      <div className="bench-runs">
+        {data.runs.map((run, index) => (
+          <span key={index} className="bench-run" title={`${run.games} jogo(s)`}>
+            {Number(run.latency).toFixed(2)} ms
+          </span>
+        ))}
+      </div>
+    </article>
+  )
+}
+
+function DlItem({ term, value, mono }) {
+  return (
+    <div>
+      <dt>{term}</dt>
+      <dd className={mono ? 'mono' : undefined}>{value ?? '—'}</dd>
+    </div>
+  )
+}
+
+function MetaBadges({ meta }) {
+  if (!meta) return null
+  return (
+    <div className="meta-row">
+      <span className={`mode-badge ${meta.consistency_mode || 'neutral'}`}>
+        Consistência {modeLabel(meta.consistency_mode)}
+      </span>
+      {meta.db_read_latency_ms !== null && meta.db_read_latency_ms !== undefined && (
+        <span className="meta-pill">Leitura {Number(meta.db_read_latency_ms).toFixed(2)} ms</span>
+      )}
+      {meta.served_by_node && (
+        <span className="meta-pill mono">served_by_node: {meta.served_by_node}</span>
+      )}
+      {meta.lamport_clock !== null && meta.lamport_clock !== undefined && (
+        <span className="meta-pill">Lamport {meta.lamport_clock}</span>
+      )}
+    </div>
+  )
+}
+
+function Field({ label, children, wide }) {
+  return (
+    <label className={wide ? 'field wide' : 'field'}>
+      <span>{label}</span>
+      {children}
+    </label>
   )
 }
 
