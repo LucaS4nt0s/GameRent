@@ -8,14 +8,17 @@ from typing import Any, Dict, Optional
 from urllib.parse import urlparse, urlunparse
 
 import boto3
+import httpx
 
 import auth
+import naming
+from lamport_clock import get_lamport_time
 
 logger = logging.getLogger("rental-service.catalog-client")
 
 
 class CatalogCommunicationError(Exception):
-    """Erro quando a comunicação de mensageria SQS com o catalog-service falha."""
+    """Erro quando a comunicação (SQS ou HTTP) com o catalog-service falha."""
     pass
 
 
@@ -33,7 +36,7 @@ class GameConflictError(Exception):
 
 class CatalogClient:
     """
-    Cliente de mensageria assíncrona baseado em Amazon SQS responsável
+    Cliente de mensageria assíncrona (Amazon SQS) e RPC HTTP responsável
     pela comunicação inter-serviços (Rental-Service -> Catalog-Service).
     """
 
@@ -44,19 +47,27 @@ class CatalogClient:
         self.region = os.getenv("AWS_REGION", "sa-east-1")
         self.req_queue_name = os.getenv("CATALOG_REQUESTS_QUEUE_NAME", "gamerent_catalog_requests")
         self.resp_queue_name = os.getenv("RENTAL_RESPONSES_QUEUE_NAME", "gamerent_rental_responses")
+        self.use_sqs = bool(self.endpoint) or os.getenv("USE_SQS", "").lower() in ("1", "true", "yes")
 
-        creds = {"aws_access_key_id": "local", "aws_secret_access_key": "local"} if self.endpoint else {}
-        self.sqs = boto3.client("sqs", endpoint_url=self.endpoint, region_name=self.region, **creds)
-
+        self.sqs = None
         self.req_queue_url: Optional[str] = None
         self.resp_queue_url: Optional[str] = None
         self._pending: Dict[str, asyncio.Future] = {}
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._lock = threading.Lock()
+        self._worker_thread = None
 
-        self._worker_thread = threading.Thread(target=self._response_worker, daemon=True)
-        self._worker_thread.start()
-        logger.info(f"CatalogClient configurado com Amazon SQS (filas: {self.req_queue_name} -> {self.resp_queue_name})")
+        if self.use_sqs:
+            creds = {
+                "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "local"),
+                "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "local"),
+            }
+            self.sqs = boto3.client("sqs", endpoint_url=self.endpoint, region_name=self.region, **creds)
+            self._worker_thread = threading.Thread(target=self._response_worker, daemon=True)
+            self._worker_thread.start()
+            logger.info(f"CatalogClient configurado com Amazon SQS (filas: {self.req_queue_name} -> {self.resp_queue_name})")
+        else:
+            logger.info(f"CatalogClient configurado com HTTP RPC para {self.base_url}")
 
     def _normalize_url(self, queue_url: str) -> str:
         if self.endpoint and "://" in queue_url:
@@ -169,15 +180,55 @@ class CatalogClient:
         renter_email: Optional[str] = None,
         lamport_clock: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Reserva atômica de exemplar via Amazon SQS."""
-        logger.info(f"Disparando reserva atômica via SQS: Jogo={game_id}, Rental={rental_id}, Clock={lamport_clock}")
-        return await self._send_and_wait("reserve", {
-            "game_id": game_id,
+        """Reserva atômica de exemplar via SQS ou HTTP com propagação de Lamport."""
+        clk = lamport_clock if lamport_clock is not None else get_lamport_time()
+        if self.use_sqs:
+            logger.info(f"Disparando reserva atômica via SQS: Jogo={game_id}, Rental={rental_id}, Clock={clk}")
+            return await self._send_and_wait("reserve", {
+                "game_id": game_id,
+                "rental_id": rental_id,
+                "renter_name": renter_name,
+                "renter_email": renter_email,
+                "lamport_clock": clk,
+            })
+
+        url = f"{self.base_url}/games/{game_id}/reserve"
+        await naming.resolve_async(self.base_url)
+        headers = {"Content-Type": "application/json", "X-Lamport-Clock": str(clk)}
+        payload = {
             "rental_id": rental_id,
             "renter_name": renter_name,
             "renter_email": renter_email,
-            "lamport_clock": lamport_clock,
-        })
+            "lamport_clock": clk,
+        }
+        logger.info(f"Disparando reserva atômica S2S: POST {url} (Rental={rental_id}, Clock={clk})")
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(url, json=payload, headers=headers)
+
+            if response.status_code == 200:
+                data = response.json()
+                resp_clock = response.headers.get("X-Lamport-Clock")
+                if resp_clock and "lamport_clock" not in data:
+                    data["lamport_clock"] = int(resp_clock)
+                logger.info(f"Reserva do jogo {game_id} confirmada pelo catálogo remoto.")
+                return data
+            elif response.status_code == 409:
+                err_detail = response.json().get("detail", "Jogo indisponível ou já reservado.")
+                logger.warning(f"Conflito 409 reportado pelo catálogo para jogo {game_id}: {err_detail}")
+                raise GameConflictError(err_detail)
+            elif response.status_code == 404:
+                err_detail = response.json().get("detail", f"Jogo com ID {game_id} não encontrado.")
+                logger.warning(f"Jogo {game_id} não encontrado no catálogo: 404 Not Found")
+                raise GameNotFoundError(err_detail)
+            else:
+                logger.error(f"Catalog-service retornou status inesperado {response.status_code}: {response.text}")
+                raise CatalogCommunicationError(f"Erro inesperado no catálogo: status {response.status_code}")
+        except (GameConflictError, GameNotFoundError):
+            raise
+        except httpx.RequestError as exc:
+            logger.error(f"Falha de rede na reserva atômica em {url}: {exc}")
+            raise CatalogCommunicationError(f"Não foi possível contatar o catalog-service ({exc})")
 
     async def release_game(
         self,
@@ -185,19 +236,99 @@ class CatalogClient:
         rental_id: Optional[str] = None,
         lamport_clock: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Liberação atômica de exemplar via Amazon SQS."""
-        logger.info(f"Disparando liberação atômica via SQS: Jogo={game_id}, Rental={rental_id}, Clock={lamport_clock}")
-        return await self._send_and_wait("release", {
-            "game_id": game_id,
-            "rental_id": rental_id,
-            "lamport_clock": lamport_clock,
-        })
+        """Liberação atômica de exemplar via SQS ou HTTP com propagação de Lamport."""
+        clk = lamport_clock if lamport_clock is not None else get_lamport_time()
+        if self.use_sqs:
+            logger.info(f"Disparando liberação atômica via SQS: Jogo={game_id}, Rental={rental_id}, Clock={clk}")
+            return await self._send_and_wait("release", {
+                "game_id": game_id,
+                "rental_id": rental_id,
+                "lamport_clock": clk,
+            })
 
-    async def get_game(self, game_id: int) -> Dict[str, Any]:
-        """Consulta dados de jogo via Amazon SQS."""
-        return await self._send_and_wait("get_game", {"game_id": game_id})
+        url = f"{self.base_url}/games/{game_id}/release"
+        await naming.resolve_async(self.base_url)
+        headers = {"Content-Type": "application/json", "X-Lamport-Clock": str(clk)}
+        payload = {"rental_id": rental_id, "lamport_clock": clk} if rental_id else {"lamport_clock": clk}
+        logger.info(f"Disparando liberação atômica S2S: POST {url} (Game={game_id}, Clock={clk})")
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(url, json=payload, headers=headers)
 
-    async def set_game_status(self, game_id: int, new_status: str) -> bool:
-        """Atualização de status via Amazon SQS."""
-        res = await self._send_and_wait("set_status", {"game_id": game_id, "status": new_status})
-        return res is not None
+            if response.status_code == 200:
+                data = response.json()
+                resp_clock = response.headers.get("X-Lamport-Clock")
+                if resp_clock and "lamport_clock" not in data:
+                    data["lamport_clock"] = int(resp_clock)
+                logger.info(f"Liberação do jogo {game_id} confirmada pelo catálogo remoto.")
+                return data
+            elif response.status_code == 409:
+                err_detail = response.json().get("detail", "Operação negada na liberação do jogo.")
+                logger.warning(f"Conflito 409 reportado pelo catálogo na liberação do jogo {game_id}: {err_detail}")
+                raise GameConflictError(err_detail)
+            elif response.status_code == 404:
+                raise GameNotFoundError(f"Jogo {game_id} não encontrado no catálogo para liberação.")
+            else:
+                raise CatalogCommunicationError(f"Erro ao liberar jogo no catálogo: {response.status_code}")
+        except (GameConflictError, GameNotFoundError):
+            raise
+        except httpx.RequestError as exc:
+            logger.error(f"Falha de rede na liberação em {url}: {exc}")
+            raise CatalogCommunicationError(f"Não foi possível contatar o catalog-service ({exc})")
+
+    async def get_game(self, game_id: int, lamport_clock: Optional[int] = None) -> Dict[str, Any]:
+        """Consulta dados de jogo via SQS ou HTTP com propagação de Lamport."""
+        clk = lamport_clock if lamport_clock is not None else get_lamport_time()
+        if self.use_sqs:
+            return await self._send_and_wait("get_game", {
+                "game_id": game_id,
+                "lamport_clock": clk,
+            })
+
+        url = f"{self.base_url}/games/{game_id}"
+        await naming.resolve_async(self.base_url)
+        headers = {"X-Lamport-Clock": str(clk)}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                resp_clock = response.headers.get("X-Lamport-Clock")
+                if resp_clock and "lamport_clock" not in data:
+                    data["lamport_clock"] = int(resp_clock)
+                return data
+            elif response.status_code == 404:
+                raise GameNotFoundError(f"Jogo {game_id} não encontrado no catálogo.")
+            else:
+                raise CatalogCommunicationError(f"Erro ao consultar catálogo: {response.status_code}")
+        except GameNotFoundError:
+            raise
+        except httpx.RequestError as exc:
+            raise CatalogCommunicationError(f"Erro de comunicação ao consultar catálogo: {exc}")
+
+    async def set_game_status(self, game_id: int, new_status: str, lamport_clock: Optional[int] = None) -> bool:
+        """Atualização de status via SQS ou HTTP com propagação de Lamport."""
+        clk = lamport_clock if lamport_clock is not None else get_lamport_time()
+        if self.use_sqs:
+            res = await self._send_and_wait("set_status", {
+                "game_id": game_id,
+                "status": new_status,
+                "lamport_clock": clk,
+            })
+            return res is not None
+
+        url = f"{self.base_url}/games/{game_id}/status"
+        await naming.resolve_async(self.base_url)
+        headers = {"X-Lamport-Clock": str(clk)}
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.patch(url, json={"status": new_status}, headers=headers)
+            if response.status_code == 200:
+                logger.info(f"Status do jogo {game_id} atualizado com sucesso no catálogo remoto.")
+                return True
+            else:
+                logger.warning(f"Falha ao atualizar status no catálogo. Código: {response.status_code}")
+                return False
+        except httpx.RequestError as exc:
+            logger.error(f"Falha de rede na atualização de status em {url}: {exc}")
+            raise CatalogCommunicationError(f"Erro de comunicação ao atualizar catálogo: {exc}")

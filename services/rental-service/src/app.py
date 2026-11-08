@@ -25,6 +25,7 @@ from catalog_client import (
 )
 import naming
 import auth
+from lamport_clock import LamportClock, clock as lamport_clock, get_lamport_time, tick_lamport
 
 # Configuração de Logs
 logging.basicConfig(
@@ -52,22 +53,12 @@ app = FastAPI(
 
 app.add_middleware(CORSMiddleware, **auth.cors_settings())
 
-_lock = threading.Lock()
-_lamport_clock = 0
-
 SERVICE_NAME = "rental-service"
 INSTANCE_ID = naming.instance_id()
 NODE_URN = naming.node_urn(SERVICE_NAME, INSTANCE_ID)
 DNS_TARGET = os.getenv("DNS_DISCOVERY_TARGET", os.getenv("CATALOG_SERVICE_URL", f"catalog.{naming.INTERNAL_DOMAIN}"))
 # dns[0] é o catálogo (o que este nó precisa achar); depois o próprio nome do rental
 DNS_TARGETS = [DNS_TARGET, f"rental.{naming.INTERNAL_DOMAIN}"]
-
-
-def tick_lamport(incoming: Optional[int] = None) -> int:
-    global _lamport_clock
-    with _lock:
-        _lamport_clock = (max(_lamport_clock, incoming) if incoming is not None else _lamport_clock) + 1
-        return _lamport_clock
 
 
 def _resolve_dns(target: str) -> DNSResolutionInfo:
