@@ -31,6 +31,12 @@ class CatalogClient:
         self.timeout = timeout_seconds
         logger.info(f"CatalogClient configurado para apontar para: {self.base_url}")
 
+    @staticmethod
+    def _service_headers() -> Dict[str, str]:
+        """Segredo compartilhado das rotas internas do catálogo (/reserve, /release)."""
+        token = os.getenv("SERVICE_TOKEN")
+        return {"X-Service-Token": token} if token else {}
+
     async def get_game(self, game_id: int) -> Dict[str, Any]:
         """
         Realiza chamada síncrona HTTP GET para obter detalhes e status do jogo.
@@ -41,7 +47,7 @@ class CatalogClient:
         logger.info(f"Disparando chamada RPC/REST síncrona: GET {url}")
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(timeout=self.timeout, headers=self._service_headers()) as client:
                 response = await client.get(url)
 
             if response.status_code == 200:
@@ -68,7 +74,7 @@ class CatalogClient:
         logger.info(f"Disparando chamada RPC/REST síncrona: PATCH {url} com status={new_status}")
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(timeout=self.timeout, headers=self._service_headers()) as client:
                 response = await client.patch(url, json={"status": new_status})
 
             if response.status_code == 200:
@@ -107,7 +113,7 @@ class CatalogClient:
         logger.info(f"Disparando reserva atômica S2S: POST {url} (Rental={rental_id}, Clock={lamport_clock})")
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(timeout=self.timeout, headers=self._service_headers()) as client:
                 response = await client.post(url, json=payload, headers=headers)
 
             if response.status_code == 200:
@@ -154,7 +160,7 @@ class CatalogClient:
         logger.info(f"Disparando liberação atômica S2S: POST {url} (Game={game_id})")
 
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
+            async with httpx.AsyncClient(timeout=self.timeout, headers=self._service_headers()) as client:
                 response = await client.post(url, json=payload, headers=headers)
 
             if response.status_code == 200:

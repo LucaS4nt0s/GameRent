@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional
-from fastapi import FastAPI, Header, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import (
@@ -25,6 +25,7 @@ from models import (
 )
 from geo_utils import calculate_haversine_distance
 import naming
+import auth
 
 SERVICE_NAME = "catalog-service"
 NODE_URN = naming.node_urn(SERVICE_NAME)
@@ -44,14 +45,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Lamport-Clock", "X-Consistency-Mode", "X-DB-Read-Latency-Ms", "X-Served-By-Node"],
-)
+app.add_middleware(CORSMiddleware, **auth.cors_settings())
 
 # ponytail: lock em memória por processo; migrar para DynamoDB ConditionalExpression em multi-réplica
 _lock = threading.Lock()
@@ -242,20 +236,6 @@ def _is_conditional_failure(exc: Exception) -> bool:
     return "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc)
 
 
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN") or None
-if ADMIN_TOKEN is None:
-    logger.warning("ADMIN_TOKEN não definido: liberação forçada (force=true) aceita sem autenticação (modo de desenvolvimento).")
-
-
-def _authorize_forced_release(x_admin_token: Optional[str]) -> None:
-    """force=true ignora o rental_id ativo; com ADMIN_TOKEN definido, exige o header X-Admin-Token."""
-    if ADMIN_TOKEN is not None and x_admin_token != ADMIN_TOKEN:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Liberação forçada exige o header X-Admin-Token válido.",
-        )
-
-
 def _reserve_ddb_game(table, game_id: int, rental_id: str, renter_name: str, clock: int) -> bool:
     """Trava atômica condicional no DynamoDB: só atualiza se status atual for AVAILABLE."""
     try:
@@ -411,7 +391,8 @@ log_dns_resolution()
 @app.get("/discovery", response_model=DiscoveryResponse, tags=["Observabilidade"])
 def get_discovery(
     response: Response,
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    _admin: Optional[auth.User] = Depends(auth.require_admin),
 ):
     """
     FC-01: Descoberta de serviços, identidade de nó (URNs), resolução DNS e telemetria.
@@ -439,9 +420,13 @@ def get_discovery(
 def create_game(
     payload: GameCreateRequest,
     response: Response,
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    user: Optional[auth.User] = Depends(auth.require_user),
 ):
     """FA-01: Cadastra um novo jogo de tabuleiro pelo locador sem expor coordenadas de GPS."""
+    if user is not None and not user.is_admin:
+        # O dono do anúncio é quem está logado, não o que veio no corpo
+        payload = payload.model_copy(update={"owner_id": user.sub, "owner_name": payload.owner_name or user.name})
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
     with _lock:
@@ -542,7 +527,8 @@ def update_game_status(
     game_id: int,
     payload: StatusUpdatePayload,
     response: Response,
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    user: Optional[auth.User] = Depends(auth.require_user),
 ):
     """
     FA-05: Atualiza o status do jogo (bloqueia com 409 Conflict se estiver RENTED
@@ -558,6 +544,12 @@ def update_game_status(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Jogo com ID {game_id} não encontrado no catálogo."
+            )
+
+        if user is not None and not user.is_admin and game.owner_id != user.sub:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Só o dono do anúncio pode alterar o status deste jogo.",
             )
 
         if (
@@ -606,7 +598,8 @@ def reserve_game(
     game_id: int,
     payload: GameReserveRequest,
     response: Response,
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    _internal: None = Depends(auth.require_service_or_admin),
 ):
     """
     FA-03 / FA-04: Reserva atômica de exemplar para locação.
@@ -683,6 +676,8 @@ def release_game(
     force: bool = Query(False, description="Liberação administrativa forçada ignorando validação de rental_id"),
     x_lamport_clock: Optional[int] = Header(default=None),
     x_admin_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    _internal: None = Depends(auth.require_service_or_admin),
 ):
     """
     FB-01: Liberação atômica de exemplar alugado.
@@ -695,7 +690,8 @@ def release_game(
 
     is_forced = force or (payload.force if payload else False)
     if is_forced:
-        _authorize_forced_release(x_admin_token)
+        # Ignora o rental_id ativo: só administradores (grupo admin do Cognito ou X-Admin-Token)
+        auth.require_admin(authorization=authorization, x_admin_token=x_admin_token)
 
     with _lock:
         game = _get_game_for_mutation(game_id)

@@ -70,3 +70,63 @@ docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
 Com o token definido, a chamada exige o header `X-Admin-Token`. Os scripts de teste o enviam
 automaticamente quando `ADMIN_TOKEN` está no ambiente. Sem o token (desenvolvimento local), a liberação
 forçada continua aberta e o catálogo registra um aviso no log.
+
+### 4. Login com Amazon Cognito e regras de acesso
+
+Os dois serviços leem `AUTH_PROVIDER`:
+
+| Valor | Quando usar | Comportamento |
+|---|---|---|
+| `none` (padrão) | desenvolvimento e testes locais | rotas abertas, como antes; quem chama informa `renter_email`/`owner_id` |
+| `cognito` | EC2 / produção | rotas de escrita exigem `Authorization: Bearer <id_token>` do Cognito |
+
+Com `cognito`, o token é validado nos próprios serviços (assinatura RS256 pelas chaves JWKS do pool, emissor,
+audiência = App client, `token_use = id` e expiração), e as regras ficam assim:
+
+| Rota | Quem pode |
+|---|---|
+| `GET /games`, `/games/nearby`, `/games/{id}`, `/health` | qualquer pessoa |
+| `POST /games` | usuário logado; o `owner_id` gravado é o `sub` do token |
+| `PATCH /games/{id}/status` | dono do anúncio ou admin |
+| `POST /rentals` | usuário logado; `renter_email` vem do token (admin pode informar outro, usado no simulador) |
+| `GET /rentals`, `GET /rentals/{id}`, `POST /rentals/{id}/return` | o próprio locatário ou admin |
+| `GET /discovery` | admin |
+| `POST /games/{id}/reserve` e `/release` | só o `rental-service` (`X-Service-Token`) ou admin; bloqueadas no nginx |
+| `POST /games/{id}/release?force=true` | admin (grupo `admin` ou `X-Admin-Token`) |
+
+Admin = usuário no grupo `admin` do User Pool. O `docker-compose.aws.yml` liga `AUTH_PROVIDER=cognito` e
+**se recusa a subir** sem `COGNITO_USER_POOL_ID`, `COGNITO_CLIENT_ID`, `SERVICE_TOKEN`, `VITE_COGNITO_DOMAIN` e
+`VITE_COGNITO_REDIRECT_URI`.
+
+**Criando o User Pool (uma vez, no console da AWS, região sa-east-1):**
+
+1. **Cognito → User pools → Create user pool.** Tipo *Traditional web application*, login por **e-mail**.
+   Atributos obrigatórios: `email` e `name`.
+2. **App client:** público, **sem client secret**, fluxo *Authorization code grant* com PKCE, escopos
+   `openid email profile`.
+   - *Allowed callback URLs* e *Allowed sign-out URLs*: o endereço do site, com a barra no final
+     (ex.: `http://<ip-publico>:8080/`). Fora de `localhost`, o Cognito só aceita `https`, então na EC2
+     use um domínio com HTTPS (por exemplo, um Application Load Balancer com certificado do ACM) ou rode o
+     login de demonstração apenas localmente.
+3. **Domain:** crie um domínio do Cognito (ex.: `jogai-gamerent`), que vira
+   `jogai-gamerent.auth.sa-east-1.amazoncognito.com`.
+4. **Groups → Create group** `admin` e adicione os usuários administradores.
+5. Anote o *User pool ID* e o *Client ID*.
+
+**Subindo na EC2:**
+
+```bash
+export COGNITO_USER_POOL_ID=sa-east-1_XXXXXXXXX
+export COGNITO_CLIENT_ID=xxxxxxxxxxxxxxxxxxxxxxxxxx
+export VITE_COGNITO_DOMAIN=jogai-gamerent.auth.sa-east-1.amazoncognito.com
+export VITE_COGNITO_REDIRECT_URI=https://<seu-dominio>/
+export SERVICE_TOKEN=$(openssl rand -hex 32)
+export ADMIN_TOKEN=$(openssl rand -hex 16)
+export CORS_ORIGINS=https://<seu-dominio>
+docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
+```
+
+Guarde esses valores fora do repositório (por exemplo, num arquivo `.env` na EC2, que já está no
+`.gitignore`). Para validar as regras sem a AWS: `python scripts/test_auth.py`, que gera tokens no formato do
+Cognito com uma chave local.
+

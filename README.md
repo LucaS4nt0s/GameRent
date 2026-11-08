@@ -77,8 +77,13 @@ Login, escolhido por `VITE_AUTH_PROVIDER` no build do front:
 | `VITE_COGNITO_CLIENT_ID` | App client público (sem segredo), com Authorization Code + PKCE |
 | `VITE_COGNITO_REDIRECT_URI` | URL de retorno cadastrada no App client (padrão: origem do site) |
 
-No modo `cognito`, admin é quem está no grupo `admin` do User Pool. O front já envia o `id_token`
-no cabeçalho `Authorization`; a validação do JWT nos serviços FastAPI ainda é um próximo passo.
+No modo `cognito`, admin é quem está no grupo `admin` do User Pool. O front envia o `id_token` no
+cabeçalho `Authorization`, e os serviços validam o token (`AUTH_PROVIDER=cognito`, ver
+[Segurança](infra/README.md#4-login-com-amazon-cognito-e-regras-de-acesso)).
+
+> ⚠️ O modo `local` não tem senha: qualquer pessoa entra com qualquer e-mail, inclusive o de admin.
+> Serve para desenvolvimento e para a demonstração local. Na EC2 use `cognito` (o `docker-compose.aws.yml`
+> já força isso).
 
 Para desenvolver só o front contra outra stack: `CATALOG_TARGET=http://localhost:8011 RENTAL_TARGET=http://localhost:8012 npm run dev`.
 
