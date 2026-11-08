@@ -56,6 +56,32 @@ Os serviços estarão disponíveis em:
 As duas réplicas do catálogo compartilham a mesma tabela no DynamoDB Local. Detalhes da infraestrutura
 local e da IAM Role na AWS em [`infra/README.md`](infra/README.md).
 
+### Front-end (marca Jogaí)
+
+O site em `frontend/` (React + Vite) separa a visão do cliente da área técnica:
+
+* **Início** (`#/`): animação da caixa guiada pela rolagem, busca por GPS do aparelho ou por cidade
+  (tabela fixa em `frontend/src/data/cities.js`, convertida em lat/lon para `GET /games/nearby`) e catálogo.
+* **Minha conta** (`#/conta`, `#/conta/jogos`, `#/conta/dados`): locações do usuário, anúncio de jogos
+  (com link opcional de foto, campo `image_url` do catálogo) e dados da conta.
+* **Área do administrador** (`#/admin`): Laboratório de Sistemas Distribuídos (disputa concorrente,
+  service discovery, comparador forte × eventual e acervo com URN/Lamport/versão). Só aparece para admins.
+
+Login, escolhido por `VITE_AUTH_PROVIDER` no build do front:
+
+| Variável | Uso |
+|---|---|
+| `VITE_AUTH_PROVIDER` | `local` (padrão, login de demonstração no navegador) ou `cognito` |
+| `VITE_ADMIN_EMAILS` | e-mails tratados como admin no modo local (padrão `admin@jogai.test`) |
+| `VITE_COGNITO_DOMAIN` | domínio do Hosted UI do User Pool (ex.: `jogai.auth.sa-east-1.amazoncognito.com`) |
+| `VITE_COGNITO_CLIENT_ID` | App client público (sem segredo), com Authorization Code + PKCE |
+| `VITE_COGNITO_REDIRECT_URI` | URL de retorno cadastrada no App client (padrão: origem do site) |
+
+No modo `cognito`, admin é quem está no grupo `admin` do User Pool. O front já envia o `id_token`
+no cabeçalho `Authorization`; a validação do JWT nos serviços FastAPI ainda é um próximo passo.
+
+Para desenvolver só o front contra outra stack: `CATALOG_TARGET=http://localhost:8011 RENTAL_TARGET=http://localhost:8012 npm run dev`.
+
 ---
 
 ## ☁️ Implantação na Nuvem (AWS)
