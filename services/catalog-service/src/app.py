@@ -26,6 +26,7 @@ from database import build_seed_games, repository, is_conditional_failure
 from geo_utils import calculate_haversine_distance
 import naming
 import auth
+from lamport_clock import LamportClock, clock as lamport_clock, get_lamport_time, tick_lamport
 
 SERVICE_NAME = "catalog-service"
 NODE_URN = naming.node_urn(SERVICE_NAME)
@@ -60,17 +61,9 @@ app.add_middleware(CORSMiddleware, **auth.cors_settings())
 
 # ponytail: lock em memória por processo; migrar para DynamoDB ConditionalExpression em multi-réplica
 _lock = threading.Lock()
-_lamport_clock = 0
 
 INSTANCE_ID = naming.instance_id()
 DNS_TARGET = os.getenv("DNS_DISCOVERY_TARGET", DNS_TARGETS[0])
-
-
-def tick_lamport(incoming: Optional[int] = None) -> int:
-    global _lamport_clock
-    with _lock:
-        _lamport_clock = (max(_lamport_clock, incoming) if incoming is not None else _lamport_clock) + 1
-        return _lamport_clock
 
 
 def _resolve_dns(target: str) -> DNSResolutionInfo:
@@ -505,6 +498,8 @@ def _core_reserve(game_id: int, rental_id: str, renter_name: str, clock: int) ->
         prev_rental = game.current_rental_id
         prev_renter = game.current_renter_name
         prev_ver = game.version
+        prev_clock = game.lamport_clock
+        prev_updated_at = game.updated_at
 
         game.status = GameStatus.RENTED
         game.current_rental_id = rental_id
@@ -524,6 +519,8 @@ def _core_reserve(game_id: int, rental_id: str, renter_name: str, clock: int) ->
                 game.current_rental_id = prev_rental
                 game.current_renter_name = prev_renter
                 game.version = prev_ver
+                game.lamport_clock = prev_clock
+                game.updated_at = prev_updated_at
             if is_conditional_failure(exc):
                 # Sincroniza estado real do DynamoDB em caso de disputa concorrente
                 _get_game_for_mutation(game_id)
@@ -557,12 +554,17 @@ def reserve_game(
     Garante exclusão mútua: se o jogo não estiver AVAILABLE, rejeita imediatamente com 409 Conflict.
     Suporta retentativas idempotentes para a mesma locação (mesmo rental_id).
     """
-    clock = tick_lamport(x_lamport_clock)
+    incoming_clock = x_lamport_clock if x_lamport_clock is not None else payload.lamport_clock
+    clock = tick_lamport(incoming_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
     logger.info(f"[LAMPORT={clock}] Tentativa de reserva atômica para o jogo ID={game_id} (Rental={_log_safe(payload.rental_id)}, Locatário={_log_safe(payload.renter_name)})")
     res = _core_reserve(game_id, payload.rental_id, payload.renter_name, clock)
     if res["status"] != 200:
-        raise HTTPException(status_code=res["status"], detail=res["detail"])
+        raise HTTPException(
+            status_code=res["status"],
+            detail=res["detail"],
+            headers={"X-Lamport-Clock": str(res.get("lamport_clock", clock))},
+        )
     return res["data"]
 
 
@@ -645,7 +647,8 @@ def release_game(
     Restaura status para AVAILABLE e limpa vínculos de locação ativa.
     Exige validação do rental_id da locação ativa para prevenir liberações desautorizadas.
     """
-    clock = tick_lamport(x_lamport_clock)
+    incoming_clock = x_lamport_clock if x_lamport_clock is not None else (payload.lamport_clock if payload else None)
+    clock = tick_lamport(incoming_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
     logger.info(f"[LAMPORT={clock}] Liberação de exemplar solicitada para o jogo ID={game_id}")
 
@@ -657,7 +660,11 @@ def release_game(
     rental_id = payload.rental_id if payload else None
     res = _core_release(game_id, rental_id, is_forced, clock)
     if res["status"] != 200:
-        raise HTTPException(status_code=res["status"], detail=res["detail"])
+        raise HTTPException(
+            status_code=res["status"],
+            detail=res["detail"],
+            headers={"X-Lamport-Clock": str(res.get("lamport_clock", clock))},
+        )
     return res["data"]
 
 
@@ -668,7 +675,10 @@ def _get_sqs_client():
     import boto3
     endpoint = os.getenv("SQS_ENDPOINT_URL") or None
     region = os.getenv("AWS_REGION", "sa-east-1")
-    creds = {"aws_access_key_id": "local", "aws_secret_access_key": "local"} if endpoint else {}
+    creds = {
+        "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "local"),
+        "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "local"),
+    } if endpoint else {}
     return boto3.client("sqs", endpoint_url=endpoint, region_name=region, **creds)
 
 
@@ -767,7 +777,7 @@ def _sqs_worker():
             time.sleep(1)
 
 
-if os.getenv("ENABLE_SQS_CONSUMER", "true").lower() in ("1", "true", "yes"):
+if os.getenv("ENABLE_SQS_CONSUMER", "true").lower() in ("1", "true", "yes") and (os.getenv("SQS_ENDPOINT_URL") or os.getenv("USE_SQS", "").lower() in ("1", "true", "yes")):
     threading.Thread(target=_sqs_worker, daemon=True).start()
 
 

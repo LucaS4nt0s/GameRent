@@ -15,6 +15,7 @@ class RentalCreateRequest(BaseModel):
     renter_email: str = Field(..., min_length=3, example="joao.silva@exemplo.com")
     game_id: int = Field(..., gt=0, example=1)
     rental_days: int = Field(..., gt=0, le=365, example=3)
+    lamport_clock: Optional[int] = Field(None, ge=0, description="Relógio de Lamport opcional enviado no payload")
 
 class RentalResponse(BaseModel):
     rental_id: str

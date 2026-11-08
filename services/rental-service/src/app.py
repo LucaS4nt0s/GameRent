@@ -25,6 +25,7 @@ from catalog_client import (
 )
 import naming
 import auth
+from lamport_clock import LamportClock, clock as lamport_clock, get_lamport_time, tick_lamport
 
 # Configuração de Logs
 logging.basicConfig(
@@ -52,22 +53,12 @@ app = FastAPI(
 
 app.add_middleware(CORSMiddleware, **auth.cors_settings())
 
-_lock = threading.Lock()
-_lamport_clock = 0
-
 SERVICE_NAME = "rental-service"
 INSTANCE_ID = naming.instance_id()
 NODE_URN = naming.node_urn(SERVICE_NAME, INSTANCE_ID)
 DNS_TARGET = os.getenv("DNS_DISCOVERY_TARGET", os.getenv("CATALOG_SERVICE_URL", f"catalog.{naming.INTERNAL_DOMAIN}"))
 # dns[0] é o catálogo (o que este nó precisa achar); depois o próprio nome do rental
 DNS_TARGETS = [DNS_TARGET, f"rental.{naming.INTERNAL_DOMAIN}"]
-
-
-def tick_lamport(incoming: Optional[int] = None) -> int:
-    global _lamport_clock
-    with _lock:
-        _lamport_clock = (max(_lamport_clock, incoming) if incoming is not None else _lamport_clock) + 1
-        return _lamport_clock
 
 
 def _resolve_dns(target: str) -> DNSResolutionInfo:
@@ -228,7 +219,8 @@ async def create_rental(
     if user is not None and not user.is_admin:
         # O locatário é quem está logado; o admin pode informar outro (ex.: simulador de disputa)
         payload = payload.model_copy(update={"renter_email": user.email, "renter_name": payload.renter_name or user.name})
-    clock = tick_lamport(x_lamport_clock)
+    incoming_clock = x_lamport_clock if x_lamport_clock is not None else payload.lamport_clock
+    clock = tick_lamport(incoming_clock)
     rental_id = str(uuid.uuid4())
     logger.info(f"[LAMPORT={clock}] Solicitação de aluguel: Jogo {payload.game_id} por {_log_safe(payload.renter_name)} (Rental={rental_id})")
 
@@ -242,7 +234,8 @@ async def create_rental(
             lamport_clock=clock
         )
     except GameConflictError as exc:
-        # Rejeição imediata com 409 Conflict
+        if getattr(exc, "lamport_clock", None) is not None:
+            clock = tick_lamport(exc.lamport_clock)
         logger.warning(f"[LAMPORT={clock}] Reserva rejeitada com 409 Conflict: {exc}")
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -409,6 +402,8 @@ async def return_rental(
         resp_clock = release_data.get("lamport_clock")
         clock = tick_lamport(resp_clock)
     except GameConflictError as exc:
+        if getattr(exc, "lamport_clock", None) is not None:
+            clock = tick_lamport(exc.lamport_clock)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),

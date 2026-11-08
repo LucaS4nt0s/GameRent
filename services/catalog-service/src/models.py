@@ -35,11 +35,13 @@ class GameReserveRequest(BaseModel):
     rental_id: str = Field(..., min_length=1, description="UUID da locação gerado pelo rental-service")
     renter_name: str = Field(..., min_length=1, description="Nome do locatário")
     renter_email: Optional[str] = Field(None, description="E-mail do locatário (opcional)")
+    lamport_clock: Optional[int] = Field(None, ge=0, description="Relógio de Lamport opcional enviado no payload")
 
 
 class GameReleaseRequest(BaseModel):
     rental_id: Optional[str] = Field(None, description="UUID da locação que está sendo encerrada (opcional)")
     force: bool = Field(False, description="Liberação administrativa forçada ignorando validação de rental_id")
+    lamport_clock: Optional[int] = Field(None, ge=0, description="Relógio de Lamport opcional enviado no payload")
 
 
 class _GameBase(BaseModel):
