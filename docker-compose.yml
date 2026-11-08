@@ -11,8 +11,11 @@ x-aws-env: &aws-env
   AWS_REGION: ${AWS_REGION:-sa-east-1}
   AWS_DEFAULT_REGION: ${AWS_REGION:-sa-east-1}
   DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+  SQS_ENDPOINT_URL: http://sqs-local:9324
   GAMES_TABLE_NAME: gamerent_games
   RENTALS_TABLE_NAME: gamerent_rentals
+  CATALOG_REQUESTS_QUEUE_NAME: gamerent_catalog_requests
+  RENTAL_RESPONSES_QUEUE_NAME: gamerent_rental_responses
 
 services:
   dynamodb-local:
@@ -23,6 +26,15 @@ services:
     ports:
       # Só na máquina local: o DynamoDB Local não tem autenticação
       - "127.0.0.1:8000:8000"
+    networks:
+      - gamerent-net
+    restart: unless-stopped
+
+  sqs-local:
+    image: softwaremill/elasticmq-native:latest
+    container_name: gamerent-sqs
+    ports:
+      - "127.0.0.1:9324:9324"
     networks:
       - gamerent-net
     restart: unless-stopped
@@ -39,8 +51,10 @@ services:
     environment:
       <<: *aws-env
       INSTANCE_ID: catalog-1
+      ENABLE_SQS_CONSUMER: "true"
     depends_on:
       - dynamodb-local
+      - sqs-local
     networks:
       - gamerent-net
     restart: unless-stopped
@@ -57,8 +71,10 @@ services:
     environment:
       <<: *aws-env
       INSTANCE_ID: catalog-2
+      ENABLE_SQS_CONSUMER: "false"
     depends_on:
       - dynamodb-local
+      - sqs-local
       - catalog-service
     networks:
       - gamerent-net
@@ -76,6 +92,7 @@ services:
       INSTANCE_ID: rental-1
       CATALOG_SERVICE_URL: http://catalog-service:8001
     depends_on:
+      - sqs-local
       - catalog-service
       - catalog-service-2
     networks:
