@@ -156,6 +156,21 @@ def is_conditional_failure(exc: Exception) -> bool:
     return "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc)
 
 
+def _scan_all(table, **kwargs) -> list[dict]:
+    """Scan paginado: o DynamoDB devolve no máximo 1 MB por chamada, então percorremos
+    ``LastEvaluatedKey`` até esgotar a tabela (evita custo e resultados truncados).
+    """
+    items: list[dict] = []
+    kwargs.pop("ExclusiveStartKey", None)
+    while True:
+        resp = table.scan(**kwargs)
+        items.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            return items
+        kwargs["ExclusiveStartKey"] = start_key
+
+
 def _to_game_item(game: Game) -> dict:
     """Serializa um objeto ``Game`` para um item válido do DynamoDB (Decimal, status como string)."""
     item = {**game.model_dump(), "status": game.status.value}
@@ -254,7 +269,7 @@ class GamesRepository:
         """
         existing_ids = {
             int(it["id"])
-            for it in table.scan(ProjectionExpression="id").get("Items", [])
+            for it in _scan_all(table, ProjectionExpression="id")
             if "id" in it
         }
         for game in self._seed_games:
@@ -349,9 +364,17 @@ class GamesRepository:
             ":now": datetime.now(timezone.utc).isoformat(),
         }
         cond = "attribute_exists(id)"
-        if not is_forced and rental_id:
+        if is_forced:
+            pass
+        elif rental_id:
             cond += " AND (current_rental_id = :rid OR attribute_not_exists(current_rental_id))"
             values[":rid"] = rental_id
+        else:
+            # Sem rental_id, a liberação só é aplicada se não houver locação ativa no instante da
+            # escrita. Fecha a janela TOCTOU entre a leitura local (em _core_release) e este update:
+            # se outra réplica reservou o exemplar nesse intervalo, a condição falha e a reserva
+            # concorrente é preservada (em vez de ter o current_rental_id removido).
+            cond += " AND attribute_not_exists(current_rental_id)"
         self._update_item(
             {"id": game_id},
             UpdateExpression=(
@@ -371,13 +394,13 @@ class GamesRepository:
 
     def scan_items(self, consistent: bool = True) -> list[dict]:
         """Todos os itens do catálogo (sem filtro)."""
-        return self.table.scan(ConsistentRead=consistent).get("Items", [])
+        return _scan_all(self.table, ConsistentRead=consistent)
 
     def scan_ids(self) -> list[int]:
         """IDs existentes (usado para escolher um ID livre no cadastro)."""
         return [
             int(it["id"])
-            for it in self.table.scan(ProjectionExpression="id").get("Items", [])
+            for it in _scan_all(self.table, ProjectionExpression="id")
             if "id" in it
         ]
 

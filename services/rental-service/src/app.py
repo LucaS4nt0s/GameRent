@@ -33,6 +33,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rental-service")
 
+# Caracteres de controle (0x00-0x1F inclui \n, \r, \t e ESC/ANSI) + DEL: removidos de valores
+# controlados pelo usuário antes de logar, prevenindo log injection.
+_CONTROL_CHARS = dict.fromkeys(range(0x20))
+_CONTROL_CHARS[0x7F] = None
+
+
+def _log_safe(value) -> str:
+    """Sanitiza um valor livre (ex.: renter_name/renter_email) antes de registrá-lo nos logs."""
+    return str(value).translate(_CONTROL_CHARS)
+
+
 app = FastAPI(
     title="GameRent — Rental Service",
     description="Microsserviço de Orquestração de Reservas e Locação com Comunicação Inter-Serviços.",
@@ -219,7 +230,7 @@ async def create_rental(
         payload = payload.model_copy(update={"renter_email": user.email, "renter_name": payload.renter_name or user.name})
     clock = tick_lamport(x_lamport_clock)
     rental_id = str(uuid.uuid4())
-    logger.info(f"[LAMPORT={clock}] Solicitação de aluguel: Jogo {payload.game_id} por {payload.renter_name} (Rental={rental_id})")
+    logger.info(f"[LAMPORT={clock}] Solicitação de aluguel: Jogo {payload.game_id} por {_log_safe(payload.renter_name)} (Rental={rental_id})")
 
     # Chamada atômica de reserva com propagação de Lamport
     try:
@@ -318,7 +329,7 @@ def list_rentals(
         renter_email = user.email  # cada locatário só vê as próprias locações
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
-    logger.info(f"[LAMPORT={clock}] Consulta de locações: renter_email={renter_email}, game_id={game_id}, status={status}")
+    logger.info(f"[LAMPORT={clock}] Consulta de locações: renter_email={_log_safe(renter_email)}, game_id={game_id}, status={status}")
 
     records = _find_rentals(renter_email=renter_email, game_id=game_id, status_filter=status)
     return [RentalResponse(**r) for r in records]

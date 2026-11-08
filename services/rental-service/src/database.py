@@ -54,6 +54,21 @@ def _from_item(item: dict) -> dict:
     return item
 
 
+def _scan_all(table, **kwargs) -> list[dict]:
+    """Scan paginado: percorre ``LastEvaluatedKey`` até esgotar a tabela (o DynamoDB devolve no
+    máximo 1 MB por chamada), evitando custo e resultados truncados em acervos grandes.
+    """
+    items: list[dict] = []
+    kwargs.pop("ExclusiveStartKey", None)
+    while True:
+        resp = table.scan(**kwargs)
+        items.extend(resp.get("Items", []))
+        start_key = resp.get("LastEvaluatedKey")
+        if not start_key:
+            return items
+        kwargs["ExclusiveStartKey"] = start_key
+
+
 class RentalsRepository:
     """Repositório das transações de locação persistido no DynamoDB (fallback ``None`` = memória)."""
 
@@ -160,7 +175,7 @@ class RentalsRepository:
         scan_kwargs = {}
         if filter_exp:
             scan_kwargs["FilterExpression"] = filter_exp
-        items = self.table.scan(**scan_kwargs).get("Items", [])
+        items = _scan_all(self.table, **scan_kwargs)
         return [_from_item(it) for it in items]
 
 

@@ -39,6 +39,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("catalog-service")
 
+# Caracteres de controle (0x00-0x1F inclui \n, \r, \t e ESC/ANSI) + DEL: removidos de valores
+# controlados pelo usuário antes de logar, prevenindo log injection.
+_CONTROL_CHARS = dict.fromkeys(range(0x20))
+_CONTROL_CHARS[0x7F] = None
+
+
+def _log_safe(value) -> str:
+    """Sanitiza um valor livre (ex.: renter_name/renter_email) antes de registrá-lo nos logs."""
+    return str(value).translate(_CONTROL_CHARS)
+
+
 app = FastAPI(
     title="GameRent — Catalog Service",
     description="Microsserviço de Catálogo e Cálculo de Proximidade Relativa de Jogos de Tabuleiro.",
@@ -135,6 +146,15 @@ if ADMIN_TOKEN is None:
     else:
         logger.warning("ADMIN_TOKEN não definido: liberação forçada (force=true) aceita sem autenticação (modo de desenvolvimento).")
 
+# Footgun de deploy: em produção (AWS) o AUTH_PROVIDER deve ser 'cognito'. Com 'none', a
+# autorização de force=true passa a depender só de ADMIN_TOKEN; sinalize com clareza.
+if PRODUCTION_AWS and auth.AUTH_PROVIDER != "cognito":
+    logger.error(
+        "PRODUCTION_AWS ativo com AUTH_PROVIDER=%r: use AUTH_PROVIDER=cognito e defina ADMIN_TOKEN "
+        "em produção (a liberação forçada fica desabilitada se ADMIN_TOKEN estiver ausente).",
+        auth.AUTH_PROVIDER,
+    )
+
 
 def _authorize_forced_release(x_admin_token: Optional[str]) -> None:
     """force=true ignora o rental_id ativo; exige X-Admin-Token quando configurado.
@@ -144,7 +164,8 @@ def _authorize_forced_release(x_admin_token: Optional[str]) -> None:
     if auth.AUTH_PROVIDER == "cognito":
         return
     if ADMIN_TOKEN is not None:
-        if x_admin_token != ADMIN_TOKEN:
+        # Comparação em tempo constante (hmac.compare_digest) para não vazar o segredo por timing.
+        if not auth.verify_admin_token(x_admin_token):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Liberação forçada exige o header X-Admin-Token válido.",
@@ -538,7 +559,7 @@ def reserve_game(
     """
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
-    logger.info(f"[LAMPORT={clock}] Tentativa de reserva atômica para o jogo ID={game_id} (Rental={payload.rental_id}, Locatário={payload.renter_name})")
+    logger.info(f"[LAMPORT={clock}] Tentativa de reserva atômica para o jogo ID={game_id} (Rental={_log_safe(payload.rental_id)}, Locatário={_log_safe(payload.renter_name)})")
     res = _core_reserve(game_id, payload.rental_id, payload.renter_name, clock)
     if res["status"] != 200:
         raise HTTPException(status_code=res["status"], detail=res["detail"])
@@ -708,7 +729,15 @@ def _sqs_worker():
                     payload = body.get("payload", {})
                     clock = tick_lamport(payload.get("lamport_clock"))
 
-                    if action == "reserve":
+                    # Autenticação da mensagem (espelha auth.require_service_or_admin das rotas HTTP):
+                    # com SERVICE_TOKEN configurado, qualquer ação exige o token no corpo da mensagem.
+                    if not auth.verify_service_token(body.get("service_token")):
+                        res = {"status": 403, "detail": "Mensagem SQS rejeitada: service_token ausente ou inválido.", "lamport_clock": clock}
+                    elif action == "set_status":
+                        # set_status exige contexto de dono (auth.require_user + checagem de owner no
+                        # HTTP). Via SQS não existe esse contexto, então negar evita escalada de privilégio.
+                        res = {"status": 403, "detail": "Atualização de status não é permitida via SQS; use o endpoint HTTP autenticado.", "lamport_clock": clock}
+                    elif action == "reserve":
                         res = _core_reserve(payload["game_id"], payload["rental_id"], payload["renter_name"], clock)
                     elif action == "release":
                         if payload.get("force"):
@@ -724,12 +753,6 @@ def _sqs_worker():
                             res = {"status": 404, "detail": f"Jogo {gid} não encontrado.", "lamport_clock": clock}
                         else:
                             res = {"status": 200, "data": GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN).model_dump(), "lamport_clock": clock}
-                    elif action == "set_status":
-                        try:
-                            new_status = payload["status"] if isinstance(payload["status"], GameStatus) else GameStatus(payload["status"])
-                            res = _core_update_status(payload["game_id"], new_status, clock)
-                        except (KeyError, ValueError):
-                            res = {"status": 400, "detail": f"Status inválido para atualização: {payload.get('status')}", "lamport_clock": clock}
                     else:
                         res = {"status": 400, "detail": f"Ação desconhecida: {action}", "lamport_clock": clock}
 
