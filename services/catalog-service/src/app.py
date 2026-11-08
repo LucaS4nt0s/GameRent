@@ -267,59 +267,80 @@ def _is_conditional_failure(exc: Exception) -> bool:
     return "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc)
 
 
-def _reserve_ddb_game(table, game_id: int, rental_id: str, renter_name: str, clock: int) -> bool:
-    """Trava atômica condicional no DynamoDB: só atualiza se status atual for AVAILABLE."""
-    try:
-        table.update_item(
-            Key={"id": game_id},
-            UpdateExpression="SET #st = :rented, current_rental_id = :rid, current_renter_name = :rname, version = version + :inc, lamport_clock = :clk, updated_at = :upd",
-            ConditionExpression="attribute_exists(id) AND #st = :avail",
-            ExpressionAttributeNames={"#st": "status"},
-            ExpressionAttributeValues={
-                ":rented": GameStatus.RENTED.value,
-                ":avail": GameStatus.AVAILABLE.value,
-                ":rid": rental_id,
-                ":rname": renter_name,
-                ":inc": 1,
-                ":clk": clock,
-                ":upd": datetime.now(timezone.utc).isoformat()
-            }
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN") or None
+# Na AWS o DynamoDB é gerenciado e DYNAMODB_ENDPOINT_URL fica vazio; no ambiente local
+# o endpoint aponta para o dynamodb-local. Sem ADMIN_TOKEN, liberação forçada só é
+# permitida no desenvolvimento local.
+PRODUCTION_AWS = (
+    os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes")
+    and not os.getenv("DYNAMODB_ENDPOINT_URL")
+)
+if ADMIN_TOKEN is None:
+    if PRODUCTION_AWS:
+        logger.error("ADMIN_TOKEN não definido: liberação forçada (force=true) DESABILITADA na AWS.")
+    else:
+        logger.warning("ADMIN_TOKEN não definido: liberação forçada (force=true) aceita sem autenticação (modo de desenvolvimento).")
+
+
+def _authorize_forced_release(x_admin_token: Optional[str]) -> None:
+    """force=true ignora o rental_id ativo; exige X-Admin-Token quando configurado.
+
+    Com AUTH_PROVIDER=cognito, auth.require_admin já validou admin/token antes desta função.
+    """
+    if auth.AUTH_PROVIDER == "cognito":
+        return
+    if ADMIN_TOKEN is not None:
+        if x_admin_token != ADMIN_TOKEN:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Liberação forçada exige o header X-Admin-Token válido.",
+            )
+    elif PRODUCTION_AWS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Liberação forçada desabilitada: configure ADMIN_TOKEN no ambiente.",
         )
-        return True
-    except Exception as exc:
-        if "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc):
-            raise
-        logger.warning(f"Erro na reserva condicional do DynamoDB para jogo {game_id}: {exc}")
-        return False
 
 
-def _release_ddb_game(table, game_id: int, rental_id: Optional[str], is_forced: bool, clock: int) -> bool:
-    """Liberação atômica condicional no DynamoDB: restaura status para AVAILABLE."""
-    try:
-        expr_names = {"#st": "status"}
-        expr_vals = {
+def _reserve_ddb_game(table, game_id: int, rental_id: str, renter_name: str, clock: int) -> None:
+    """Trava atômica condicional no DynamoDB: só atualiza se status atual for AVAILABLE."""
+    table.update_item(
+        Key={"id": game_id},
+        UpdateExpression="SET #st = :rented, current_rental_id = :rid, current_renter_name = :rname, version = version + :inc, lamport_clock = :clk, updated_at = :upd",
+        ConditionExpression="attribute_exists(id) AND #st = :avail",
+        ExpressionAttributeNames={"#st": "status"},
+        ExpressionAttributeValues={
+            ":rented": GameStatus.RENTED.value,
             ":avail": GameStatus.AVAILABLE.value,
+            ":rid": rental_id,
+            ":rname": renter_name,
             ":inc": 1,
             ":clk": clock,
-            ":upd": datetime.now(timezone.utc).isoformat(),
+            ":upd": datetime.now(timezone.utc).isoformat()
         }
-        cond = "attribute_exists(id)"
-        if not is_forced and rental_id:
-            cond += " AND (current_rental_id = :rid OR attribute_not_exists(current_rental_id))"
-            expr_vals[":rid"] = rental_id
-        table.update_item(
-            Key={"id": game_id},
-            UpdateExpression="SET #st = :avail, version = version + :inc, lamport_clock = :clk, updated_at = :upd REMOVE current_rental_id, current_renter_name",
-            ConditionExpression=cond,
-            ExpressionAttributeNames=expr_names,
-            ExpressionAttributeValues=expr_vals,
-        )
-        return True
-    except Exception as exc:
-        if "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc):
-            raise
-        logger.warning(f"Erro na liberação condicional do DynamoDB para jogo {game_id}: {exc}")
-        return False
+    )
+
+
+def _release_ddb_game(table, game_id: int, rental_id: Optional[str], is_forced: bool, clock: int) -> None:
+    """Liberação atômica condicional no DynamoDB: restaura status para AVAILABLE."""
+    expr_names = {"#st": "status"}
+    expr_vals = {
+        ":avail": GameStatus.AVAILABLE.value,
+        ":inc": 1,
+        ":clk": clock,
+        ":upd": datetime.now(timezone.utc).isoformat(),
+    }
+    cond = "attribute_exists(id)"
+    if not is_forced and rental_id:
+        cond += " AND (current_rental_id = :rid OR attribute_not_exists(current_rental_id))"
+        expr_vals[":rid"] = rental_id
+    table.update_item(
+        Key={"id": game_id},
+        UpdateExpression="SET #st = :avail, version = version + :inc, lamport_clock = :clk, updated_at = :upd REMOVE current_rental_id, current_renter_name",
+        ConditionExpression=cond,
+        ExpressionAttributeNames=expr_names,
+        ExpressionAttributeValues=expr_vals,
+    )
 
 
 def _get_game_for_mutation(game_id: int) -> Optional[Game]:
@@ -335,17 +356,6 @@ def _get_game_for_mutation(game_id: int) -> Optional[Game]:
         except Exception as exc:
             logger.warning(f"Erro ao sincronizar jogo {game_id} do DynamoDB: {exc}")
     return GAMES_DB.get(game_id)
-
-
-def _save_game(game: Game) -> GamePublicResponse:
-    GAMES_DB[game.id] = game
-    table = _get_ddb_table()
-    if table is not None:
-        try:
-            _put_ddb_game(table, game)
-        except Exception as exc:
-            logger.warning(f"Falha ao persistir jogo {game.id} no DynamoDB: {exc}")
-    return GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN)
 
 
 def _read_games(consistency: ConsistencyMode) -> tuple[list[Game], float]:
@@ -553,48 +563,38 @@ def get_game_by_id(game_id: int, response: Response, consistency: ConsistencyMod
     return GamePublicResponse(**game.model_dump(), **meta)
 
 
-@app.patch("/games/{game_id}/status", response_model=GamePublicResponse, tags=["Catálogo"])
-def update_game_status(
+def _core_update_status(
     game_id: int,
-    payload: StatusUpdatePayload,
-    response: Response,
-    x_lamport_clock: Optional[int] = Header(default=None),
-    user: Optional[auth.User] = Depends(auth.require_user),
-):
-    """
-    FA-05: Atualiza o status do jogo (bloqueia com 409 Conflict se estiver RENTED
-    e tentar ir para MAINTENANCE ou ser locado novamente, permitindo devolução para AVAILABLE).
-    """
-    clock = tick_lamport(x_lamport_clock)
-    response.headers["X-Lamport-Clock"] = str(clock)
-    logger.info(f"[LAMPORT={clock}] Atualização de status do jogo ID={game_id} para {payload.status.value}")
-
+    new_status: GameStatus,
+    clock: int,
+    user: Optional[auth.User] = None,
+) -> dict:
     with _lock:
         game = _get_game_for_mutation(game_id)
         if game is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Jogo com ID {game_id} não encontrado no catálogo."
-            )
+            logger.warning(f"Jogo ID={game_id} não encontrado para atualização de status.")
+            return {"status": 404, "detail": f"Jogo com ID {game_id} não encontrado no catálogo.", "lamport_clock": clock}
 
         if user is not None and not user.is_admin and game.owner_id != user.sub:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Só o dono do anúncio pode alterar o status deste jogo.",
-            )
+            return {
+                "status": 403,
+                "detail": "Só o dono do anúncio pode alterar o status deste jogo.",
+                "lamport_clock": clock,
+            }
 
         if (
-            (game.status == GameStatus.RENTED and payload.status != GameStatus.AVAILABLE)
-            or (game.status == GameStatus.MAINTENANCE and payload.status == GameStatus.RENTED)
+            (game.status == GameStatus.RENTED and new_status != GameStatus.AVAILABLE)
+            or (game.status == GameStatus.MAINTENANCE and new_status == GameStatus.RENTED)
         ):
-            logger.warning(f"[LAMPORT={clock}] Conflito 409: tentativa de alterar jogo ID={game_id} de {game.status.value} para {payload.status.value}")
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Transição inválida de '{game.status.value}' para '{payload.status.value}' no jogo '{game.title}'."
-            )
+            logger.warning(f"[LAMPORT={clock}] Conflito 409: tentativa de alterar jogo ID={game_id} de {game.status.value} para {new_status.value}")
+            return {
+                "status": 409,
+                "detail": f"Transição inválida de '{game.status.value}' para '{new_status.value}' no jogo '{game.title}'.",
+                "lamport_clock": clock,
+            }
 
         expected_version = game.version
-        game.status = payload.status
+        game.status = new_status
         game.version += 1
         game.lamport_clock = clock
         game.updated_at = datetime.now(timezone.utc).isoformat()
@@ -613,15 +613,101 @@ def update_game_status(
                 _get_game_for_mutation(game_id)  # descarta a mudança local e recarrega o estado real
                 if _is_conditional_failure(exc):
                     logger.warning(f"[LAMPORT={clock}] Conflito 409: jogo ID={game_id} mudou durante a atualização de status")
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=f"O jogo '{game.title}' foi alterado por outra operação; atualize e tente novamente.",
-                    )
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail=f"Falha ao persistir o status no DynamoDB: {exc}",
-                )
-    return GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN)
+                    return {
+                        "status": 409,
+                        "detail": f"O jogo '{game.title}' foi alterado por outra operação; atualize e tente novamente.",
+                        "lamport_clock": clock,
+                    }
+                return {
+                    "status": 503,
+                    "detail": f"Falha ao persistir o status no DynamoDB: {exc}",
+                    "lamport_clock": clock,
+                }
+    return {"status": 200, "data": GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN).model_dump(), "lamport_clock": clock}
+
+
+@app.patch("/games/{game_id}/status", response_model=GamePublicResponse, tags=["Catálogo"])
+def update_game_status(
+    game_id: int,
+    payload: StatusUpdatePayload,
+    response: Response,
+    x_lamport_clock: Optional[int] = Header(default=None),
+    user: Optional[auth.User] = Depends(auth.require_user),
+):
+    """
+    FA-05: Atualiza o status do jogo (bloqueia com 409 Conflict se estiver RENTED
+    e tentar ir para MAINTENANCE ou ser locado novamente, permitindo devolução para AVAILABLE).
+    """
+    clock = tick_lamport(x_lamport_clock)
+    response.headers["X-Lamport-Clock"] = str(clock)
+    logger.info(f"[LAMPORT={clock}] Atualização de status do jogo ID={game_id} para {payload.status.value}")
+    res = _core_update_status(game_id, payload.status, clock, user=user)
+    if res["status"] != 200:
+        raise HTTPException(status_code=res["status"], detail=res["detail"])
+    return res["data"]
+
+
+def _core_reserve(game_id: int, rental_id: str, renter_name: str, clock: int) -> dict:
+    with _lock:
+        game = _get_game_for_mutation(game_id)
+        if game is None:
+            logger.warning(f"Jogo ID={game_id} não encontrado para reserva.")
+            return {"status": 404, "detail": f"Jogo com ID {game_id} não encontrado no catálogo.", "lamport_clock": clock}
+
+        # Idempotência: se já estiver RENTED para o mesmo rental_id, confirma sem erro
+        if game.status == GameStatus.RENTED and game.current_rental_id == rental_id:
+            logger.info(f"[LAMPORT={clock}] Retentativa idempotente de reserva confirmada para jogo ID={game_id} (Rental={rental_id}).")
+            return {
+                "status": 200,
+                "data": GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN).model_dump(),
+                "lamport_clock": clock,
+            }
+
+        if game.status != GameStatus.AVAILABLE:
+            logger.warning(f"[LAMPORT={clock}] Conflito 409: Jogo ID={game_id} indisponível para reserva (status atual: {game.status.value})")
+            return {"status": 409, "detail": f"O jogo '{game.title}' não está disponível para reserva no momento (status atual: {game.status.value}).", "lamport_clock": clock}
+
+        prev_status = game.status
+        prev_rental = game.current_rental_id
+        prev_renter = game.current_renter_name
+        prev_ver = game.version
+
+        game.status = GameStatus.RENTED
+        game.current_rental_id = rental_id
+        game.current_renter_name = renter_name
+        game.version += 1
+        game.lamport_clock = clock
+        game.updated_at = datetime.now(timezone.utc).isoformat()
+
+    # I/O DynamoDB executado fora do lock em memória para evitar thread starvation
+    table = _get_ddb_table()
+    if table is not None:
+        try:
+            _reserve_ddb_game(table, game_id, rental_id, renter_name, clock)
+        except Exception as exc:
+            with _lock:
+                game.status = prev_status
+                game.current_rental_id = prev_rental
+                game.current_renter_name = prev_renter
+                game.version = prev_ver
+            if _is_conditional_failure(exc):
+                # Sincroniza estado real do DynamoDB em caso de disputa concorrente
+                _get_game_for_mutation(game_id)
+                logger.warning(f"[LAMPORT={clock}] DynamoDB ConditionalCheckFailedException para jogo ID={game_id}")
+                return {"status": 409, "detail": f"Conflito de concorrência: o jogo '{game.title}' acabou de ser reservado por outro locatário.", "lamport_clock": clock}
+            logger.warning(f"Erro ao persistir reserva no DynamoDB: {exc}")
+            return {"status": 503, "detail": f"Falha ao persistir a reserva no DynamoDB: {exc}", "lamport_clock": clock}
+
+    if table is not None:
+        # Não reescrever o item de forma incondicional: a reserva já foi aplicada pelo
+        # update condicional acima. Relê o estado canônico para responder sem lost update.
+        game = _get_game_for_mutation(game_id) or game
+    logger.info(f"[LAMPORT={clock}] Jogo ID={game_id} reservado com sucesso para rental {rental_id}.")
+    return {
+        "status": 200,
+        "data": GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN).model_dump(),
+        "lamport_clock": clock,
+    }
 
 
 @app.post("/games/{game_id}/reserve", response_model=GamePublicResponse, tags=["Catálogo"])
@@ -640,63 +726,73 @@ def reserve_game(
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
     logger.info(f"[LAMPORT={clock}] Tentativa de reserva atômica para o jogo ID={game_id} (Rental={payload.rental_id}, Locatário={payload.renter_name})")
+    res = _core_reserve(game_id, payload.rental_id, payload.renter_name, clock)
+    if res["status"] != 200:
+        raise HTTPException(status_code=res["status"], detail=res["detail"])
+    return res["data"]
 
+
+def _core_release(game_id: int, rental_id: Optional[str], is_forced: bool, clock: int) -> dict:
     with _lock:
         game = _get_game_for_mutation(game_id)
         if game is None:
-            logger.warning(f"Jogo ID={game_id} não encontrado para reserva.")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Jogo com ID {game_id} não encontrado no catálogo."
-            )
+            logger.warning(f"Jogo ID={game_id} não encontrado para liberação.")
+            return {"status": 404, "detail": f"Jogo com ID {game_id} não encontrado no catálogo.", "lamport_clock": clock}
 
-        # Idempotência: se já estiver RENTED para o mesmo rental_id, confirma sem erro
-        if game.status == GameStatus.RENTED and game.current_rental_id == payload.rental_id:
-            logger.info(f"[LAMPORT={clock}] Retentativa idempotente de reserva confirmada para jogo ID={game_id} (Rental={payload.rental_id}).")
-            return _save_game(game)
-
-        if game.status != GameStatus.AVAILABLE:
-            logger.warning(f"[LAMPORT={clock}] Conflito 409: Jogo ID={game_id} indisponível para reserva (status atual: {game.status.value})")
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"O jogo '{game.title}' não está disponível para reserva no momento (status atual: {game.status.value})."
-            )
+        # Validação de segurança: se o jogo estiver RENTED com um rental_id ativo,
+        # exige confirmação do rental_id correspondente (salvo se liberação forçada)
+        if not is_forced and game.status == GameStatus.RENTED and game.current_rental_id:
+            if not rental_id or rental_id != game.current_rental_id:
+                logger.warning(
+                    f"[LAMPORT={clock}] Conflito 409 na liberação: rental_id fornecido '{rental_id}' "
+                    f"não coincide com a locação ativa '{game.current_rental_id}' do jogo ID={game_id}."
+                )
+                return {
+                    "status": 409,
+                    "detail": f"Operação negada: o rental_id informado não corresponde à locação ativa do jogo '{game.title}'.",
+                    "lamport_clock": clock,
+                }
 
         prev_status = game.status
         prev_rental = game.current_rental_id
         prev_renter = game.current_renter_name
-        prev_ver = game.version
+        prev_version = game.version
+        prev_clock = game.lamport_clock
+        prev_updated_at = game.updated_at
 
-        game.status = GameStatus.RENTED
-        game.current_rental_id = payload.rental_id
-        game.current_renter_name = payload.renter_name
+        game.status = GameStatus.AVAILABLE
+        game.current_rental_id = None
+        game.current_renter_name = None
         game.version += 1
         game.lamport_clock = clock
         game.updated_at = datetime.now(timezone.utc).isoformat()
 
-    # I/O DynamoDB executado fora do lock em memória para evitar thread starvation
     table = _get_ddb_table()
     if table is not None:
         try:
-            _reserve_ddb_game(table, game_id, payload.rental_id, payload.renter_name, clock)
+            _release_ddb_game(table, game_id, rental_id, is_forced, clock)
         except Exception as exc:
             with _lock:
                 game.status = prev_status
                 game.current_rental_id = prev_rental
                 game.current_renter_name = prev_renter
-                game.version = prev_ver
-            if "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc):
-                # Sincroniza estado real do DynamoDB em caso de disputa concorrente
+                game.version = prev_version
+                game.lamport_clock = prev_clock
+                game.updated_at = prev_updated_at
+            if _is_conditional_failure(exc):
+                # A liberação local já foi desfeita; recarrega o estado canônico do DynamoDB
                 _get_game_for_mutation(game_id)
-                logger.warning(f"[LAMPORT={clock}] DynamoDB ConditionalCheckFailedException para jogo ID={game_id}")
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Conflito de concorrência: o jogo '{game.title}' acabou de ser reservado por outro locatário."
-                )
-            logger.warning(f"Erro ao persistir reserva no DynamoDB: {exc}")
+                return {
+                    "status": 409,
+                    "detail": f"Operação negada: o rental_id informado não corresponde à locação ativa do jogo '{game.title}'.",
+                    "lamport_clock": clock,
+                }
+            logger.warning(f"Erro ao persistir liberação no DynamoDB: {exc}")
+            return {"status": 503, "detail": f"Falha ao persistir a liberação no DynamoDB: {exc}", "lamport_clock": clock}
+        game = _get_game_for_mutation(game_id) or game
 
-    logger.info(f"[LAMPORT={clock}] Jogo ID={game_id} reservado com sucesso para rental {payload.rental_id}.")
-    return _save_game(game)
+    logger.info(f"[LAMPORT={clock}] Jogo ID={game_id} liberado com sucesso para AVAILABLE.")
+    return {"status": 200, "data": GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN).model_dump(), "lamport_clock": clock}
 
 
 @app.post("/games/{game_id}/release", response_model=GamePublicResponse, tags=["Catálogo"])
@@ -723,53 +819,120 @@ def release_game(
     if is_forced:
         # Ignora o rental_id ativo: só administradores (grupo admin do Cognito ou X-Admin-Token)
         auth.require_admin(authorization=authorization, x_admin_token=x_admin_token)
+        _authorize_forced_release(x_admin_token)
+    rental_id = payload.rental_id if payload else None
+    res = _core_release(game_id, rental_id, is_forced, clock)
+    if res["status"] != 200:
+        raise HTTPException(status_code=res["status"], detail=res["detail"])
+    return res["data"]
 
-    with _lock:
-        game = _get_game_for_mutation(game_id)
-        if game is None:
-            logger.warning(f"Jogo ID={game_id} não encontrado para liberação.")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Jogo com ID {game_id} não encontrado no catálogo."
-            )
 
-        # Validação de segurança: se o jogo estiver RENTED com um rental_id ativo,
-        # exige confirmação do rental_id correspondente (salvo se liberação forçada)
-        if not is_forced and game.status == GameStatus.RENTED and game.current_rental_id:
-            provided_rental_id = payload.rental_id if payload else None
-            if not provided_rental_id or provided_rental_id != game.current_rental_id:
-                logger.warning(
-                    f"[LAMPORT={clock}] Conflito 409 na liberação: rental_id fornecido '{provided_rental_id}' "
-                    f"não coincide com a locação ativa '{game.current_rental_id}' do jogo ID={game_id}."
-                )
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Operação negada: o rental_id informado não corresponde à locação ativa do jogo '{game.title}'."
-                )
+# ---------------------------------------------------------
+# Consumidor Amazon SQS para comunicação inter-serviços
+# ---------------------------------------------------------
+def _get_sqs_client():
+    import boto3
+    endpoint = os.getenv("SQS_ENDPOINT_URL") or None
+    region = os.getenv("AWS_REGION", "sa-east-1")
+    creds = {"aws_access_key_id": "local", "aws_secret_access_key": "local"} if endpoint else {}
+    return boto3.client("sqs", endpoint_url=endpoint, region_name=region, **creds)
 
-        game.status = GameStatus.AVAILABLE
-        game.current_rental_id = None
-        game.current_renter_name = None
-        game.version += 1
-        game.lamport_clock = clock
-        game.updated_at = datetime.now(timezone.utc).isoformat()
 
-    table = _get_ddb_table()
-    if table is not None:
+def _normalize_sqs_url(queue_url: str, endpoint: Optional[str]) -> str:
+    if endpoint and "://" in queue_url:
+        from urllib.parse import urlparse, urlunparse
+        end_p = urlparse(endpoint)
+        q_p = urlparse(queue_url)
+        return urlunparse(q_p._replace(scheme=end_p.scheme, netloc=end_p.netloc))
+    return queue_url
+
+
+def _get_or_create_sqs_queue(sqs, name: str, endpoint: Optional[str]) -> str:
+    try:
+        url = sqs.get_queue_url(QueueName=name)["QueueUrl"]
+    except Exception:
         try:
-            _release_ddb_game(table, game_id, payload.rental_id if payload else None, is_forced, clock)
-        except Exception as exc:
-            if _is_conditional_failure(exc):
-                # A liberação local já foi aplicada acima: desfaz recarregando o estado real
-                _get_game_for_mutation(game_id)
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Operação negada: o rental_id informado não corresponde à locação ativa do jogo '{game.title}'."
-                )
-            logger.warning(f"Erro ao persistir liberação no DynamoDB: {exc}")
+            url = sqs.create_queue(QueueName=name)["QueueUrl"]
+        except Exception:
+            # Corrida entre processos: outra instância pode ter criado a fila neste instante
+            url = sqs.get_queue_url(QueueName=name)["QueueUrl"]
+    return _normalize_sqs_url(url, endpoint)
 
-    logger.info(f"[LAMPORT={clock}] Jogo ID={game_id} liberado com sucesso para AVAILABLE.")
-    return GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN)
+
+def _sqs_worker():
+    import json
+    endpoint = os.getenv("SQS_ENDPOINT_URL") or None
+    req_queue_name = os.getenv("CATALOG_REQUESTS_QUEUE_NAME", "gamerent_catalog_requests")
+    sqs = None
+    req_url = None
+
+    while True:
+        try:
+            sqs = _get_sqs_client()
+            req_url = _get_or_create_sqs_queue(sqs, req_queue_name, endpoint)
+            logger.info(f"Consumidor SQS do Catálogo ativo na fila: {req_url}")
+            break
+        except Exception as exc:
+            logger.warning(f"Aguardando inicialização da fila SQS {req_queue_name}: {exc}")
+            time.sleep(2)
+
+    while True:
+        try:
+            resp = sqs.receive_message(
+                QueueUrl=req_url,
+                MaxNumberOfMessages=5,
+                WaitTimeSeconds=2,
+            )
+            for msg in resp.get("Messages", []):
+                receipt = msg["ReceiptHandle"]
+                try:
+                    body = json.loads(msg["Body"])
+                    corr_id = body.get("correlation_id")
+                    reply_to = body.get("reply_to")
+                    if reply_to:
+                        reply_to = _normalize_sqs_url(reply_to, endpoint)
+                    action = body.get("action")
+                    payload = body.get("payload", {})
+                    clock = tick_lamport(payload.get("lamport_clock"))
+
+                    if action == "reserve":
+                        res = _core_reserve(payload["game_id"], payload["rental_id"], payload["renter_name"], clock)
+                    elif action == "release":
+                        if payload.get("force"):
+                            # A liberação forçada ignora a locação ativa e não deve ser aceita
+                            # por mensageria interna; use o endpoint HTTP com ADMIN_TOKEN.
+                            res = {"status": 403, "detail": "Liberação forçada não é permitida via SQS.", "lamport_clock": clock}
+                        else:
+                            res = _core_release(payload["game_id"], payload.get("rental_id"), False, clock)
+                    elif action == "get_game":
+                        gid = payload["game_id"]
+                        game, _ = _read_game(gid, "strong")
+                        if game is None:
+                            res = {"status": 404, "detail": f"Jogo {gid} não encontrado.", "lamport_clock": clock}
+                        else:
+                            res = {"status": 200, "data": GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN).model_dump(), "lamport_clock": clock}
+                    elif action == "set_status":
+                        try:
+                            new_status = payload["status"] if isinstance(payload["status"], GameStatus) else GameStatus(payload["status"])
+                            res = _core_update_status(payload["game_id"], new_status, clock)
+                        except (KeyError, ValueError):
+                            res = {"status": 400, "detail": f"Status inválido para atualização: {payload.get('status')}", "lamport_clock": clock}
+                    else:
+                        res = {"status": 400, "detail": f"Ação desconhecida: {action}", "lamport_clock": clock}
+
+                    if reply_to and corr_id:
+                        res["correlation_id"] = corr_id
+                        sqs.send_message(QueueUrl=reply_to, MessageBody=json.dumps(res))
+                except Exception as exc:
+                    logger.error(f"Erro processando mensagem SQS no catálogo: {exc}")
+                finally:
+                    sqs.delete_message(QueueUrl=req_url, ReceiptHandle=receipt)
+        except Exception:
+            time.sleep(1)
+
+
+if os.getenv("ENABLE_SQS_CONSUMER", "true").lower() in ("1", "true", "yes"):
+    threading.Thread(target=_sqs_worker, daemon=True).start()
 
 
 if __name__ == "__main__":

@@ -68,8 +68,11 @@ docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
 ```
 
 Com o token definido, a chamada exige o header `X-Admin-Token`. Os scripts de teste o enviam
-automaticamente quando `ADMIN_TOKEN` está no ambiente. Sem o token (desenvolvimento local), a liberação
-forçada continua aberta e o catálogo registra um aviso no log.
+automaticamente quando `ADMIN_TOKEN` está no ambiente.
+
+Na AWS (DynamoDB gerenciado, sem `DYNAMODB_ENDPOINT_URL`), se `ADMIN_TOKEN` não estiver definido a
+liberação forçada é **recusada com 403**. No desenvolvimento local com DynamoDB Local ela continua
+aberta para não quebrar os testes, e o catálogo registra um aviso no log.
 
 ### 4. Login com Amazon Cognito e regras de acesso
 
@@ -129,4 +132,13 @@ docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
 Guarde esses valores fora do repositório (por exemplo, num arquivo `.env` na EC2, que já está no
 `.gitignore`). Para validar as regras sem a AWS: `python scripts/test_auth.py`, que gera tokens no formato do
 Cognito com uma chave local.
+
+### 5. Mensageria Amazon SQS
+
+O `rental-service` conversa com o `catalog-service` por **Amazon SQS**. A IAM Role permite criar as
+filas `gamerent_*`, enviar, receber e apagar mensagens; nenhuma URL ou chave de acesso fica no código.
+No ambiente local o `docker-compose.yml` sobe `softwaremill/elasticmq-native` (`sqs-local`); na AWS o
+`SQS_ENDPOINT_URL` fica vazio e o boto3 usa a região `sa-east-1` com as credenciais da Instance Profile.
+As duas réplicas do catálogo consomem a mesma fila (competing consumers), e a exclusão mútua é garantida
+pelas escritas condicionais no DynamoDB.
 

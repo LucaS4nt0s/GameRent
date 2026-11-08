@@ -5,6 +5,7 @@ do Amazon Cognito (iss, aud, token_use, cognito:groups). Sobe catalog-service (:
 rental-service (:8002) com AUTH_PROVIDER=cognito e SERVICE_TOKEN e verifica as regras de acesso.
 
 Requer: pip install "PyJWT[crypto]" fastapi uvicorn httpx boto3
+SQS: use o ElasticMQ local (`docker compose up -d sqs-local`) ou defina SQS_ENDPOINT_URL.
 """
 from __future__ import annotations
 
@@ -100,6 +101,7 @@ def start(service: str, port: int):
         "AUTH_PROVIDER": "cognito", "COGNITO_REGION": REGION, "COGNITO_USER_POOL_ID": POOL,
         "COGNITO_CLIENT_ID": CLIENT, "COGNITO_JWKS_URL": f"http://127.0.0.1:{JWKS_PORT}/jwks.json",
         "SERVICE_TOKEN": SERVICE_TOKEN, "CATALOG_SERVICE_URL": CATALOG,
+        "SQS_ENDPOINT_URL": os.getenv("SQS_ENDPOINT_URL", "http://127.0.0.1:9324"),
     }
     env.pop("DYNAMODB_ENDPOINT_URL", None)
     env.pop("USE_DYNAMODB", None)
