@@ -116,7 +116,11 @@ def _save_rental(record: dict) -> RentalResponse:
         try:
             repository.put_rental(record)
         except Exception as exc:
-            logger.warning(f"Falha ao persistir locação {rental_id} no DynamoDB: {exc}")
+            logger.error(f"Falha ao persistir locação {rental_id} no DynamoDB: {exc}")
+            if os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") or repository.enabled:
+                raise
+    elif os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes"):
+        raise RuntimeError("DynamoDB obrigatório mas desconectado")
     return RentalResponse(**record)
 
 
@@ -263,12 +267,13 @@ async def create_rental(
     daily_rate = float(game_data.get("price_per_day", 0.0))
     total_price = round(daily_rate * payload.rental_days, 2)
     created_at_iso = datetime.now(timezone.utc).isoformat()
+    canonical_game_urn = game_data.get("urn") or f"urn:gamerent:game:sa-east-1:{payload.game_id}"
 
     rental_record = {
         "rental_id": rental_id,
         "urn": f"urn:gamerent:rental:{rental_id}",
         "game_id": payload.game_id,
-        "game_urn": game_data.get("urn", f"urn:gamerent:game:sa-east-1:{payload.game_id}"),
+        "game_urn": canonical_game_urn,
         "game_title": game_data.get("title", ""),
         "renter_name": payload.renter_name,
         "renter_email": payload.renter_email,
@@ -278,14 +283,13 @@ async def create_rental(
         "status": RentalStatus.CONFIRMED,
         "lamport_clock": clock,
         "created_at": created_at_iso,
-        # URN canônico vem do catálogo (dono do recurso), não é recalculado com a região deste nó
-        "game_urn": game_data.get("urn", ""),
-        "returned_at": None
+        "returned_at": None,
     }
 
     try:
         resp_obj = _save_rental(rental_record)
     except Exception as exc:
+        RENTALS_DB.pop(rental_id, None)
         logger.error(f"[LAMPORT={clock}] Falha ao persistir locação {rental_id}: {exc}. Executando rollback compensatório no catálogo.")
         try:
             await catalog_client.release_game(
