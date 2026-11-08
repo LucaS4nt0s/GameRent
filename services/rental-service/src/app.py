@@ -16,6 +16,7 @@ from models import (
     RentalResponse,
     RentalStatus,
 )
+from database import repository
 from catalog_client import (
     CatalogClient,
     CatalogCommunicationError,
@@ -96,77 +97,22 @@ catalog_client = CatalogClient()
 # Base em memória para reservas
 RENTALS_DB: Dict[str, dict] = {}
 
-# Helper DynamoDB para persistência de locações
-_ddb_table = None
-
 
 def _get_ddb_table():
-    global _ddb_table
-    if _ddb_table is not None:
-        return _ddb_table
-    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL") or None
-    if not (os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") or endpoint):
-        return None
-    try:
-        import boto3
-        # dynamodb-local aceita qualquer credencial; na AWS deixamos o boto3 usar a cadeia padrão
-        # (IAM Role da EC2), sem injetar chaves fictícias que sobrescreveriam o Instance Profile.
-        creds = (
-            {
-                "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "local"),
-                "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "local"),
-            }
-            if endpoint
-            else {}
-        )
-        ddb = boto3.resource(
-            "dynamodb",
-            region_name=os.getenv("AWS_REGION", "sa-east-1"),
-            endpoint_url=endpoint,
-            **creds,
-        )
-        name = os.getenv("RENTALS_TABLE_NAME", "gamerent_rentals")
-        try:
-            table = (
-                ddb.Table(name)
-                if name in [t.name for t in ddb.tables.all()]
-                else ddb.create_table(
-                    TableName=name,
-                    KeySchema=[{"AttributeName": "rental_id", "KeyType": "HASH"}],
-                    AttributeDefinitions=[{"AttributeName": "rental_id", "AttributeType": "S"}],
-                    BillingMode="PAY_PER_REQUEST",
-                )
-            )
-        except ddb.meta.client.exceptions.ResourceInUseException:
-            table = ddb.Table(name)
-        table.wait_until_exists()
-        _ddb_table = table
-        return _ddb_table
-    except Exception as exc:
-        log = logger.error if os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") else logger.warning
-        log(f"DynamoDB indisponível, operando com RENTALS_DB em memória: {exc}")
-        return None
+    """Retorna a tabela do DynamoDB via repositório (database.py).
 
-
-def _put_ddb_rental(table, record: dict) -> None:
-    from decimal import Decimal
-    item = {**record}
-    if isinstance(item.get("status"), RentalStatus):
-        item["status"] = item["status"].value
-    for k in ("daily_rate", "total_price"):
-        if k in item and item[k] is not None:
-            item[k] = Decimal(str(item[k]))
-    clean_item = {k: v for k, v in item.items() if v is not None}
-    table.put_item(Item=clean_item)
+    A criação automática da tabela ``gamerent_rentals`` fica no repositório; aqui apenas
+    devolvemos a referência (``None`` quando o banco não está configurado/indisponível).
+    """
+    return repository.table
 
 
 def _save_rental(record: dict) -> RentalResponse:
     rental_id = record["rental_id"]
     RENTALS_DB[rental_id] = record
-    table = _get_ddb_table()
-    if table is not None:
+    if repository.connected:
         try:
-            _put_ddb_rental(table, record)
+            repository.put_rental(record)
         except Exception as exc:
             logger.warning(f"Falha ao persistir locação {rental_id} no DynamoDB: {exc}")
     return RentalResponse(**record)
@@ -178,37 +124,14 @@ def _find_rentals(
     status_filter: Optional[RentalStatus] = None
 ) -> List[dict]:
     """Consulta locações no DynamoDB ou na memória local com suporte a múltiplos predicados de filtro."""
-    table = _get_ddb_table()
-    if table is not None:
+    if repository.connected:
         try:
-            from boto3.dynamodb.conditions import Attr
-            filter_exp = None
-            if renter_email:
-                filter_exp = Attr("renter_email").eq(renter_email)
-            if game_id is not None:
-                cond = Attr("game_id").eq(game_id)
-                filter_exp = filter_exp & cond if filter_exp else cond
-            if status_filter:
-                st_val = status_filter.value if isinstance(status_filter, RentalStatus) else str(status_filter)
-                cond = Attr("status").eq(st_val)
-                filter_exp = filter_exp & cond if filter_exp else cond
-
-            scan_kwargs = {}
-            if filter_exp:
-                scan_kwargs["FilterExpression"] = filter_exp
-            resp = table.scan(**scan_kwargs)
-            items = resp.get("Items", [])
+            items = repository.scan_rentals(
+                renter_email=renter_email,
+                game_id=game_id,
+                status_filter=status_filter,
+            )
             for item in items:
-                if "daily_rate" in item:
-                    item["daily_rate"] = float(item["daily_rate"])
-                if "total_price" in item:
-                    item["total_price"] = float(item["total_price"])
-                if "game_id" in item:
-                    item["game_id"] = int(item["game_id"])
-                if "rental_days" in item:
-                    item["rental_days"] = int(item["rental_days"])
-                if "lamport_clock" in item:
-                    item["lamport_clock"] = int(item["lamport_clock"])
                 RENTALS_DB[item["rental_id"]] = item
             return items
         except Exception as exc:
@@ -414,17 +337,10 @@ def _ensure_owner(rental: dict, user: Optional[auth.User]) -> None:
 def get_rental(rental_id: str, user: Optional[auth.User] = Depends(auth.require_user)):
     """Consulta detalhes de uma locação específica."""
     if rental_id not in RENTALS_DB:
-        table = _get_ddb_table()
-        if table is not None:
+        if repository.connected:
             try:
-                item = table.get_item(Key={"rental_id": rental_id}).get("Item")
+                item = repository.get_rental(rental_id)
                 if item:
-                    for k in ("daily_rate", "total_price"):
-                        if k in item and item[k] is not None:
-                            item[k] = float(item[k])
-                    for k in ("game_id", "rental_days", "lamport_clock"):
-                        if k in item and item[k] is not None:
-                            item[k] = int(item[k])
                     RENTALS_DB[rental_id] = item
             except Exception as exc:
                 logger.warning(f"Falha ao buscar locação {rental_id} no DynamoDB: {exc}")
@@ -452,17 +368,10 @@ async def return_rental(
     clock = tick_lamport(x_lamport_clock)
 
     if rental_id not in RENTALS_DB:
-        table = _get_ddb_table()
-        if table is not None:
+        if repository.connected:
             try:
-                item = table.get_item(Key={"rental_id": rental_id}).get("Item")
+                item = repository.get_rental(rental_id)
                 if item:
-                    for k in ("daily_rate", "total_price"):
-                        if k in item and item[k] is not None:
-                            item[k] = float(item[k])
-                    for k in ("game_id", "rental_days", "lamport_clock"):
-                        if k in item and item[k] is not None:
-                            item[k] = int(item[k])
                     RENTALS_DB[rental_id] = item
             except Exception as exc:
                 logger.warning(f"Falha ao recuperar locação {rental_id} no DynamoDB: {exc}")

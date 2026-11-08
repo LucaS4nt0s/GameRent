@@ -4,7 +4,6 @@ import socket
 import threading
 import time
 from datetime import datetime, timezone
-from decimal import Decimal
 from typing import List, Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +22,7 @@ from models import (
     GameStatus,
     StatusUpdatePayload,
 )
+from database import build_seed_games, repository, is_conditional_failure
 from geo_utils import calculate_haversine_distance
 import naming
 import auth
@@ -94,177 +94,31 @@ def _get_dynamodb_status() -> DynamoDBStatusInfo:
     )
 
 
-# Base de dados em memória inicial (Jogos de Tabuleiro)
-GAMES_DB: dict[int, Game] = {
-    1: Game(
-        id=1,
-        title="Catan (Os Colonizadores de Catan)",
-        description="Clássico jogo de negociação, comércio e colonização.",
-        category="Estratégia",
-        price_per_day=15.0,
-        status=GameStatus.AVAILABLE,
-        owner_id="locador-001",
-        owner_name="Ana Paula",
-        latitude=-23.5505,
-        longitude=-46.6333  # Região Central de SP
-    ),
-    2: Game(
-        id=2,
-        title="Terraforming Mars",
-        description="Corporações competindo para tornar Marte habitável.",
-        category="Estratégia Pesada",
-        price_per_day=25.0,
-        status=GameStatus.AVAILABLE,
-        owner_id="locador-002",
-        owner_name="Carlos Eduardo",
-        latitude=-23.5615,
-        longitude=-46.6560  # Av. Paulista
-    ),
-    3: Game(
-        id=3,
-        title="Dixit",
-        description="Jogo de dedução visual e imaginação com belas ilustrações.",
-        category="Party Game",
-        price_per_day=12.0,
-        status=GameStatus.AVAILABLE,
-        owner_id="locador-001",
-        owner_name="Ana Paula",
-        latitude=-23.5505,
-        longitude=-46.6333
-    ),
-    4: Game(
-        id=4,
-        title="Ticket to Ride: Europa",
-        description="Aventura ferroviária conectando cidades pelo continente.",
-        category="Familiar",
-        price_per_day=18.0,
-        status=GameStatus.RENTED,  # Inicialmente já locado para testes de conflito
-        owner_id="locador-003",
-        owner_name="Mariana Souza",
-        latitude=-23.5874,
-        longitude=-46.6795  # Itaim Bibi
-    ),
-    5: Game(
-        id=5,
-        title="Pandemic",
-        description="Jogo cooperativo contra surtos globais de doenças.",
-        category="Cooperativo",
-        price_per_day=16.0,
-        status=GameStatus.AVAILABLE,
-        owner_id="locador-002",
-        owner_name="Carlos Eduardo",
-        latitude=-23.5615,
-        longitude=-46.6560
-    )
-}
-
-# Acervo de Poços de Caldas (MG). IDs a partir de 101 para não colidir com jogos cadastrados pelos
-# locadores; coordenadas aproximadas dos bairros (só o servidor as vê, o cliente recebe a distância).
-_POCOS = [
-    (101, "Carcassonne", "Monte cidades, estradas e mosteiros peça por peça. Ótimo para 2 a 5 pessoas.",
-     "Família", 14.0, "locador-pc-001", "Fernanda Lima", -21.7880, -46.5617),        # Centro
-    (102, "Azul", "Crie o mosaico mais bonito do palácio com azulejos coloridos.",
-     "Estratégia", 15.0, "locador-pc-001", "Fernanda Lima", -21.7880, -46.5617),     # Centro
-    (103, "Codenames", "Duas equipes, pistas de uma palavra e muita risada. Ideal para grupos.",
-     "Festa", 10.0, "locador-pc-002", "Rafael Prado", -21.7983, -46.5590),           # Jardim dos Estados
-    (104, "Splendor", "Negocie gemas e conquiste a nobreza do Renascimento.",
-     "Estratégia", 13.0, "locador-pc-002", "Rafael Prado", -21.7983, -46.5590),      # Jardim dos Estados
-    (105, "Wingspan", "Atraia aves para a sua reserva em um jogo calmo e lindo de ver.",
-     "Estratégia", 22.0, "locador-pc-003", "Juliana Ribeiro", -21.7740, -46.5560),   # Country Club
-    (106, "Dobble", "Rápido e divertido: ache o símbolo repetido antes de todo mundo.",
-     "Infantil", 8.0, "locador-pc-003", "Juliana Ribeiro", -21.7845, -46.5726),      # Vila Cruz
-]
-for _id, _title, _desc, _cat, _price, _owner_id, _owner, _lat, _lon in _POCOS:
-    GAMES_DB[_id] = Game(
-        id=_id, title=_title, description=_desc, category=_cat, price_per_day=_price,
-        status=GameStatus.AVAILABLE, owner_id=_owner_id, owner_name=_owner, latitude=_lat, longitude=_lon,
-    )
-SEED_GAMES: dict[int, Game] = dict(GAMES_DB)
+# Base de dados em memória (fallback quando o DynamoDB está indisponível). A fonte de
+# verdade é o Amazon DynamoDB; GAMES_DB nasce do seed (build_seed_games) e é sincronizado
+# com a tabela na primeira conexão bem-sucedida.
+GAMES_DB: dict[int, Game] = build_seed_games()
 
 # ponytail: scan/get_item com ConsistentRead e filtro Haversine em memória; usar GeoIndex/GSI se acervo crescer >10k itens
-_ddb_table = None
+_games_db_loaded = False
 
 
 def _get_ddb_table():
-    global _ddb_table
-    if _ddb_table is not None:
-        return _ddb_table
-    endpoint = os.getenv("DYNAMODB_ENDPOINT_URL") or None
-    if not (os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") or endpoint):
-        return None
-    try:
-        import boto3
-        # dynamodb-local aceita qualquer credencial; na AWS deixamos o boto3 usar a cadeia padrão
-        # (IAM Role da EC2), sem injetar chaves fictícias que sobrescreveriam o Instance Profile.
-        creds = (
-            {
-                "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "local"),
-                "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "local"),
-            }
-            if endpoint
-            else {}
-        )
-        ddb = boto3.resource(
-            "dynamodb",
-            region_name=os.getenv("AWS_REGION", "sa-east-1"),
-            endpoint_url=endpoint,
-            **creds,
-        )
-        name = os.getenv("GAMES_TABLE_NAME", "gamerent_games")
-        try:
-            table = (
-                ddb.Table(name)
-                if name in [t.name for t in ddb.tables.all()]
-                else ddb.create_table(
-                    TableName=name,
-                    KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
-                    AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "N"}],
-                    BillingMode="PAY_PER_REQUEST",
-                )
-            )
-        except ddb.meta.client.exceptions.ResourceInUseException:
-            # Outra réplica do catalog-service criou a tabela ao mesmo tempo
-            table = ddb.Table(name)
-        table.wait_until_exists()
-        items = table.scan().get("Items", [])
-        existing_ids = set()
-        for it in items:
+    """Retorna a tabela do DynamoDB via repositório e sincroniza o GAMES_DB na 1ª conexão.
+
+    A criação automática da tabela e o seed inicial ficam no repositório (database.py);
+    aqui apenas espelhamos o conteúdo persistido no fallback em memória (GAMES_DB).
+    """
+    global _games_db_loaded
+    table = repository.table
+    if table is not None and not _games_db_loaded:
+        _games_db_loaded = True
+        for it in repository.scan_items(consistent=False):
             try:
                 GAMES_DB[int(it["id"])] = Game(**it)
-                existing_ids.add(int(it["id"]))
             except Exception:
                 pass
-        # Semeia só o que falta (ex.: tabela criada antes do acervo de Poços de Caldas), sem
-        # sobrescrever estado existente: a condição garante isso mesmo com duas réplicas subindo juntas.
-        for game_id, g in SEED_GAMES.items():
-            if game_id in existing_ids:
-                continue
-            try:
-                _put_ddb_game(table, g, {"ConditionExpression": "attribute_not_exists(id)"})
-            except Exception as exc:
-                if not _is_conditional_failure(exc):
-                    raise
-        _ddb_table = table
-        return _ddb_table
-    except Exception as exc:
-        # Com USE_DYNAMODB=true (AWS) cair para memória quebra o estado compartilhado entre réplicas
-        log = logger.error if os.getenv("USE_DYNAMODB", "").lower() in ("1", "true", "yes") else logger.warning
-        log(f"DynamoDB indisponível, operando com GAMES_DB em memória: {exc}")
-        return None
-
-
-def _put_ddb_game(table, game: Game, condition: Optional[dict] = None) -> None:
-    """Grava o item; `condition` = kwargs extras do put_item (ConditionExpression etc.)."""
-    item = {**game.model_dump(), "status": game.status.value}
-    for k in ("price_per_day", "latitude", "longitude"):
-        if k in item and item[k] is not None:
-            item[k] = Decimal(str(item[k]))
-    clean_item = {k: v for k, v in item.items() if v is not None}
-    table.put_item(Item=clean_item, **(condition or {}))
-
-
-def _is_conditional_failure(exc: Exception) -> bool:
-    return "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc)
+    return table
 
 
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN") or None
@@ -302,53 +156,12 @@ def _authorize_forced_release(x_admin_token: Optional[str]) -> None:
         )
 
 
-def _reserve_ddb_game(table, game_id: int, rental_id: str, renter_name: str, clock: int) -> None:
-    """Trava atômica condicional no DynamoDB: só atualiza se status atual for AVAILABLE."""
-    table.update_item(
-        Key={"id": game_id},
-        UpdateExpression="SET #st = :rented, current_rental_id = :rid, current_renter_name = :rname, version = version + :inc, lamport_clock = :clk, updated_at = :upd",
-        ConditionExpression="attribute_exists(id) AND #st = :avail",
-        ExpressionAttributeNames={"#st": "status"},
-        ExpressionAttributeValues={
-            ":rented": GameStatus.RENTED.value,
-            ":avail": GameStatus.AVAILABLE.value,
-            ":rid": rental_id,
-            ":rname": renter_name,
-            ":inc": 1,
-            ":clk": clock,
-            ":upd": datetime.now(timezone.utc).isoformat()
-        }
-    )
-
-
-def _release_ddb_game(table, game_id: int, rental_id: Optional[str], is_forced: bool, clock: int) -> None:
-    """Liberação atômica condicional no DynamoDB: restaura status para AVAILABLE."""
-    expr_names = {"#st": "status"}
-    expr_vals = {
-        ":avail": GameStatus.AVAILABLE.value,
-        ":inc": 1,
-        ":clk": clock,
-        ":upd": datetime.now(timezone.utc).isoformat(),
-    }
-    cond = "attribute_exists(id)"
-    if not is_forced and rental_id:
-        cond += " AND (current_rental_id = :rid OR attribute_not_exists(current_rental_id))"
-        expr_vals[":rid"] = rental_id
-    table.update_item(
-        Key={"id": game_id},
-        UpdateExpression="SET #st = :avail, version = version + :inc, lamport_clock = :clk, updated_at = :upd REMOVE current_rental_id, current_renter_name",
-        ConditionExpression=cond,
-        ExpressionAttributeNames=expr_names,
-        ExpressionAttributeValues=expr_vals,
-    )
-
-
 def _get_game_for_mutation(game_id: int) -> Optional[Game]:
     """Obtém o jogo para mutação, sincronizando com DynamoDB com ConsistentRead."""
     table = _get_ddb_table()
     if table is not None:
         try:
-            item = table.get_item(Key={"id": game_id}, ConsistentRead=True).get("Item")
+            item = repository.get_item(game_id, consistent=True)
             if item:
                 game = Game(**item)
                 GAMES_DB[game_id] = game
@@ -363,7 +176,7 @@ def _read_games(consistency: ConsistencyMode) -> tuple[list[Game], float]:
     t0 = time.perf_counter()
     if table is not None:
         try:
-            items = table.scan(ConsistentRead=(consistency == "strong")).get("Items", [])
+            items = repository.scan_items(consistent=(consistency == "strong"))
             games = sorted((Game(**it) for it in items), key=lambda g: g.id)
             return games, round((time.perf_counter() - t0) * 1000, 3)
         except Exception as exc:
@@ -376,7 +189,7 @@ def _read_game(game_id: int, consistency: ConsistencyMode) -> tuple[Optional[Gam
     t0 = time.perf_counter()
     if table is not None:
         try:
-            item = table.get_item(Key={"id": game_id}, ConsistentRead=(consistency == "strong")).get("Item")
+            item = repository.get_item(game_id, consistent=(consistency == "strong"))
             return (Game(**item) if item else None), round((time.perf_counter() - t0) * 1000, 3)
         except Exception as exc:
             logger.warning(f"Falha ao ler jogo {game_id} no DynamoDB: {exc}")
@@ -481,19 +294,19 @@ def create_game(
             # O scan dá um palpite; a gravação condicional (attribute_not_exists) garante que duas
             # réplicas nunca fiquem com o mesmo ID: quem perde a corrida tenta o próximo.
             try:
-                items = table.scan(ProjectionExpression="id").get("Items", [])
-                max_id = max(max_id, max([int(it["id"]) for it in items], default=0))
+                existing_ids = repository.scan_ids()
+                max_id = max(max_id, max(existing_ids, default=0))
             except Exception as exc:
                 logger.warning(f"Falha ao consultar maior ID no DynamoDB: {exc}")
             game = None
             for attempt in range(10):
                 candidate = Game(id=max_id + 1 + attempt, lamport_clock=clock, **payload.model_dump())
                 try:
-                    _put_ddb_game(table, candidate, {"ConditionExpression": "attribute_not_exists(id)"})
+                    repository.put_game(candidate, condition={"ConditionExpression": "attribute_not_exists(id)"})
                     game = candidate
                     break
                 except Exception as exc:
-                    if not _is_conditional_failure(exc):
+                    if not is_conditional_failure(exc):
                         raise HTTPException(
                             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail=f"Falha ao persistir o jogo no DynamoDB: {exc}",
@@ -604,14 +417,14 @@ def _core_update_status(
             # Controle otimista: só grava se ninguém (outra réplica, uma reserva) mudou o item
             # desde a leitura forte acima. Sem isso, o put_item sobrescreve uma reserva concorrente.
             try:
-                _put_ddb_game(table, game, {
+                repository.put_game(game, condition={
                     "ConditionExpression": "#v = :expected",
                     "ExpressionAttributeNames": {"#v": "version"},
                     "ExpressionAttributeValues": {":expected": expected_version},
                 })
             except Exception as exc:
                 _get_game_for_mutation(game_id)  # descarta a mudança local e recarrega o estado real
-                if _is_conditional_failure(exc):
+                if is_conditional_failure(exc):
                     logger.warning(f"[LAMPORT={clock}] Conflito 409: jogo ID={game_id} mudou durante a atualização de status")
                     return {
                         "status": 409,
@@ -683,14 +496,14 @@ def _core_reserve(game_id: int, rental_id: str, renter_name: str, clock: int) ->
     table = _get_ddb_table()
     if table is not None:
         try:
-            _reserve_ddb_game(table, game_id, rental_id, renter_name, clock)
+            repository.reserve_game_atomically(game_id, rental_id, clock, renter_name)
         except Exception as exc:
             with _lock:
                 game.status = prev_status
                 game.current_rental_id = prev_rental
                 game.current_renter_name = prev_renter
                 game.version = prev_ver
-            if _is_conditional_failure(exc):
+            if is_conditional_failure(exc):
                 # Sincroniza estado real do DynamoDB em caso de disputa concorrente
                 _get_game_for_mutation(game_id)
                 logger.warning(f"[LAMPORT={clock}] DynamoDB ConditionalCheckFailedException para jogo ID={game_id}")
@@ -770,7 +583,7 @@ def _core_release(game_id: int, rental_id: Optional[str], is_forced: bool, clock
     table = _get_ddb_table()
     if table is not None:
         try:
-            _release_ddb_game(table, game_id, rental_id, is_forced, clock)
+            repository.release_game_atomically(game_id, clock, rental_id=rental_id, is_forced=is_forced)
         except Exception as exc:
             with _lock:
                 game.status = prev_status
@@ -779,7 +592,7 @@ def _core_release(game_id: int, rental_id: Optional[str], is_forced: bool, clock
                 game.version = prev_version
                 game.lamport_clock = prev_clock
                 game.updated_at = prev_updated_at
-            if _is_conditional_failure(exc):
+            if is_conditional_failure(exc):
                 # A liberação local já foi desfeita; recarrega o estado canônico do DynamoDB
                 _get_game_for_mutation(game_id)
                 return {
