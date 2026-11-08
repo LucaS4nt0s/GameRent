@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional
-from fastapi import FastAPI, Header, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import (
@@ -25,6 +25,7 @@ from models import (
 )
 from geo_utils import calculate_haversine_distance
 import naming
+import auth
 
 SERVICE_NAME = "catalog-service"
 NODE_URN = naming.node_urn(SERVICE_NAME)
@@ -44,14 +45,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Lamport-Clock", "X-Consistency-Mode", "X-DB-Read-Latency-Ms", "X-Served-By-Node"],
-)
+app.add_middleware(CORSMiddleware, **auth.cors_settings())
 
 # ponytail: lock em memória por processo; migrar para DynamoDB ConditionalExpression em multi-réplica
 _lock = threading.Lock()
@@ -164,6 +158,29 @@ GAMES_DB: dict[int, Game] = {
     )
 }
 
+# Acervo de Poços de Caldas (MG). IDs a partir de 101 para não colidir com jogos cadastrados pelos
+# locadores; coordenadas aproximadas dos bairros (só o servidor as vê, o cliente recebe a distância).
+_POCOS = [
+    (101, "Carcassonne", "Monte cidades, estradas e mosteiros peça por peça. Ótimo para 2 a 5 pessoas.",
+     "Família", 14.0, "locador-pc-001", "Fernanda Lima", -21.7880, -46.5617),        # Centro
+    (102, "Azul", "Crie o mosaico mais bonito do palácio com azulejos coloridos.",
+     "Estratégia", 15.0, "locador-pc-001", "Fernanda Lima", -21.7880, -46.5617),     # Centro
+    (103, "Codenames", "Duas equipes, pistas de uma palavra e muita risada. Ideal para grupos.",
+     "Festa", 10.0, "locador-pc-002", "Rafael Prado", -21.7983, -46.5590),           # Jardim dos Estados
+    (104, "Splendor", "Negocie gemas e conquiste a nobreza do Renascimento.",
+     "Estratégia", 13.0, "locador-pc-002", "Rafael Prado", -21.7983, -46.5590),      # Jardim dos Estados
+    (105, "Wingspan", "Atraia aves para a sua reserva em um jogo calmo e lindo de ver.",
+     "Estratégia", 22.0, "locador-pc-003", "Juliana Ribeiro", -21.7740, -46.5560),   # Country Club
+    (106, "Dobble", "Rápido e divertido: ache o símbolo repetido antes de todo mundo.",
+     "Infantil", 8.0, "locador-pc-003", "Juliana Ribeiro", -21.7845, -46.5726),      # Vila Cruz
+]
+for _id, _title, _desc, _cat, _price, _owner_id, _owner, _lat, _lon in _POCOS:
+    GAMES_DB[_id] = Game(
+        id=_id, title=_title, description=_desc, category=_cat, price_per_day=_price,
+        status=GameStatus.AVAILABLE, owner_id=_owner_id, owner_name=_owner, latitude=_lat, longitude=_lon,
+    )
+SEED_GAMES: dict[int, Game] = dict(GAMES_DB)
+
 # ponytail: scan/get_item com ConsistentRead e filtro Haversine em memória; usar GeoIndex/GSI se acervo crescer >10k itens
 _ddb_table = None
 
@@ -210,15 +227,23 @@ def _get_ddb_table():
             table = ddb.Table(name)
         table.wait_until_exists()
         items = table.scan().get("Items", [])
-        if not items:
-            for g in GAMES_DB.values():
-                _put_ddb_game(table, g)
-        else:
-            for it in items:
-                try:
-                    GAMES_DB[int(it["id"])] = Game(**it)
-                except Exception:
-                    pass
+        existing_ids = set()
+        for it in items:
+            try:
+                GAMES_DB[int(it["id"])] = Game(**it)
+                existing_ids.add(int(it["id"]))
+            except Exception:
+                pass
+        # Semeia só o que falta (ex.: tabela criada antes do acervo de Poços de Caldas), sem
+        # sobrescrever estado existente: a condição garante isso mesmo com duas réplicas subindo juntas.
+        for game_id, g in SEED_GAMES.items():
+            if game_id in existing_ids:
+                continue
+            try:
+                _put_ddb_game(table, g, {"ConditionExpression": "attribute_not_exists(id)"})
+            except Exception as exc:
+                if not _is_conditional_failure(exc):
+                    raise
         _ddb_table = table
         return _ddb_table
     except Exception as exc:
@@ -258,7 +283,12 @@ if ADMIN_TOKEN is None:
 
 
 def _authorize_forced_release(x_admin_token: Optional[str]) -> None:
-    """force=true ignora o rental_id ativo; exige X-Admin-Token quando configurado."""
+    """force=true ignora o rental_id ativo; exige X-Admin-Token quando configurado.
+
+    Com AUTH_PROVIDER=cognito, auth.require_admin já validou admin/token antes desta função.
+    """
+    if auth.AUTH_PROVIDER == "cognito":
+        return
     if ADMIN_TOKEN is not None:
         if x_admin_token != ADMIN_TOKEN:
             raise HTTPException(
@@ -402,7 +432,8 @@ log_dns_resolution()
 @app.get("/discovery", response_model=DiscoveryResponse, tags=["Observabilidade"])
 def get_discovery(
     response: Response,
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    _admin: Optional[auth.User] = Depends(auth.require_admin),
 ):
     """
     FC-01: Descoberta de serviços, identidade de nó (URNs), resolução DNS e telemetria.
@@ -430,9 +461,13 @@ def get_discovery(
 def create_game(
     payload: GameCreateRequest,
     response: Response,
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    user: Optional[auth.User] = Depends(auth.require_user),
 ):
     """FA-01: Cadastra um novo jogo de tabuleiro pelo locador sem expor coordenadas de GPS."""
+    if user is not None and not user.is_admin:
+        # O dono do anúncio é quem está logado, não o que veio no corpo
+        payload = payload.model_copy(update={"owner_id": user.sub, "owner_name": payload.owner_name or user.name})
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
     with _lock:
@@ -528,12 +563,24 @@ def get_game_by_id(game_id: int, response: Response, consistency: ConsistencyMod
     return GamePublicResponse(**game.model_dump(), **meta)
 
 
-def _core_update_status(game_id: int, new_status: GameStatus, clock: int) -> dict:
+def _core_update_status(
+    game_id: int,
+    new_status: GameStatus,
+    clock: int,
+    user: Optional[auth.User] = None,
+) -> dict:
     with _lock:
         game = _get_game_for_mutation(game_id)
         if game is None:
             logger.warning(f"Jogo ID={game_id} não encontrado para atualização de status.")
             return {"status": 404, "detail": f"Jogo com ID {game_id} não encontrado no catálogo.", "lamport_clock": clock}
+
+        if user is not None and not user.is_admin and game.owner_id != user.sub:
+            return {
+                "status": 403,
+                "detail": "Só o dono do anúncio pode alterar o status deste jogo.",
+                "lamport_clock": clock,
+            }
 
         if (
             (game.status == GameStatus.RENTED and new_status != GameStatus.AVAILABLE)
@@ -584,7 +631,8 @@ def update_game_status(
     game_id: int,
     payload: StatusUpdatePayload,
     response: Response,
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    user: Optional[auth.User] = Depends(auth.require_user),
 ):
     """
     FA-05: Atualiza o status do jogo (bloqueia com 409 Conflict se estiver RENTED
@@ -593,7 +641,7 @@ def update_game_status(
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
     logger.info(f"[LAMPORT={clock}] Atualização de status do jogo ID={game_id} para {payload.status.value}")
-    res = _core_update_status(game_id, payload.status, clock)
+    res = _core_update_status(game_id, payload.status, clock, user=user)
     if res["status"] != 200:
         raise HTTPException(status_code=res["status"], detail=res["detail"])
     return res["data"]
@@ -667,7 +715,8 @@ def reserve_game(
     game_id: int,
     payload: GameReserveRequest,
     response: Response,
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    _internal: None = Depends(auth.require_service_or_admin),
 ):
     """
     FA-03 / FA-04: Reserva atômica de exemplar para locação.
@@ -754,6 +803,8 @@ def release_game(
     force: bool = Query(False, description="Liberação administrativa forçada ignorando validação de rental_id"),
     x_lamport_clock: Optional[int] = Header(default=None),
     x_admin_token: Optional[str] = Header(default=None),
+    authorization: Optional[str] = Header(default=None),
+    _internal: None = Depends(auth.require_service_or_admin),
 ):
     """
     FB-01: Liberação atômica de exemplar alugado.
@@ -766,6 +817,8 @@ def release_game(
 
     is_forced = force or (payload.force if payload else False)
     if is_forced:
+        # Ignora o rental_id ativo: só administradores (grupo admin do Cognito ou X-Admin-Token)
+        auth.require_admin(authorization=authorization, x_admin_token=x_admin_token)
         _authorize_forced_release(x_admin_token)
     rental_id = payload.rental_id if payload else None
     res = _core_release(game_id, rental_id, is_forced, clock)

@@ -1,6 +1,17 @@
 const CATALOG = import.meta.env.VITE_CATALOG_URL || '/api/catalog'
 const RENTAL = import.meta.env.VITE_RENTAL_URL || '/api/rental'
 
+// Token do Cognito (id_token) quando o login real estiver ligado; os serviços podem validá-lo depois.
+let authToken = null
+export function setAuthToken(token) {
+  authToken = token
+}
+
+function withAuth(options = {}) {
+  if (!authToken) return options
+  return { ...options, headers: { ...(options.headers || {}), Authorization: `Bearer ${authToken}` } }
+}
+
 function readMeta(res) {
   const latency = res.headers.get('X-DB-Read-Latency-Ms')
   const lamport = res.headers.get('X-Lamport-Clock')
@@ -30,7 +41,7 @@ function errorMessage(body, status) {
 }
 
 async function request(url, options) {
-  const res = await fetch(url, options)
+  const res = await fetch(url, withAuth(options))
   const body = await parseBody(res)
   if (!res.ok) {
     const error = new Error(errorMessage(body, res.status))
@@ -144,11 +155,14 @@ export const api = {
       return { ...response.body, _meta: response.meta }
     },
     createRentalRaw: async (payload) => {
-      const res = await fetch(`${RENTAL}/rentals`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
+      const res = await fetch(
+        `${RENTAL}/rentals`,
+        withAuth({
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+      )
       const body = await parseBody(res)
       return {
         ok: res.ok,

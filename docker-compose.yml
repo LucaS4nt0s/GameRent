@@ -103,6 +103,12 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        VITE_AUTH_PROVIDER: ${VITE_AUTH_PROVIDER:-local}
+        VITE_ADMIN_EMAILS: ${VITE_ADMIN_EMAILS:-}
+        VITE_COGNITO_DOMAIN: ${VITE_COGNITO_DOMAIN:-}
+        VITE_COGNITO_CLIENT_ID: ${VITE_COGNITO_CLIENT_ID:-}
+        VITE_COGNITO_REDIRECT_URI: ${VITE_COGNITO_REDIRECT_URI:-}
     container_name: gamerent-frontend
     ports:
       - "8080:80"

@@ -13,8 +13,24 @@ x-aws-managed: &aws-managed
   # Protege POST /games/{id}/release?force=true (exige o header X-Admin-Token).
   # Defina antes de subir: export ADMIN_TOKEN=$(openssl rand -hex 16)
   ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+  # Login real (ver infra/README.md, "Login com Amazon Cognito"). Obrigatórios em produção.
+  AUTH_PROVIDER: ${AUTH_PROVIDER:-cognito}
+  COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:?defina COGNITO_USER_POOL_ID}
+  COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:?defina COGNITO_CLIENT_ID}
+  # Segredo das rotas internas rental -> catalog (/reserve, /release)
+  SERVICE_TOKEN: ${SERVICE_TOKEN:?defina SERVICE_TOKEN}
+  # Origens que podem chamar a API pelo navegador (ex.: http://<ip-publico>:8080)
+  CORS_ORIGINS: ${CORS_ORIGINS:-*}
 
 services:
+  frontend:
+    build:
+      args:
+        VITE_AUTH_PROVIDER: cognito
+        VITE_COGNITO_DOMAIN: ${VITE_COGNITO_DOMAIN:?defina VITE_COGNITO_DOMAIN}
+        VITE_COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:?defina COGNITO_CLIENT_ID}
+        VITE_COGNITO_REDIRECT_URI: ${VITE_COGNITO_REDIRECT_URI:?defina VITE_COGNITO_REDIRECT_URI}
+
   catalog-service:
     environment:
       <<: *aws-managed

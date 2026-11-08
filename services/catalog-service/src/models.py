@@ -23,6 +23,12 @@ class GameCreateRequest(BaseModel):
     owner_name: str = Field(..., min_length=1)
     latitude: float = Field(..., ge=-90.0, le=90.0)
     longitude: float = Field(..., ge=-180.0, le=180.0)
+    image_url: Optional[str] = Field(
+        None,
+        max_length=1000,
+        pattern=r"^https?://",
+        description="Link público da foto da caixa do jogo (opcional)",
+    )
 
 
 class GameReserveRequest(BaseModel):
@@ -51,6 +57,7 @@ class _GameBase(BaseModel):
     lamport_clock: int = 1
     current_rental_id: Optional[str] = None
     current_renter_name: Optional[str] = None
+    image_url: Optional[str] = None
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
     def model_post_init(self, __context) -> None:

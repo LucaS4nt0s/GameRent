@@ -5,7 +5,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
-from fastapi import FastAPI, Header, HTTPException, Query, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
 from models import (
@@ -23,6 +23,7 @@ from catalog_client import (
     GameNotFoundError,
 )
 import naming
+import auth
 
 # Configuração de Logs
 logging.basicConfig(
@@ -37,14 +38,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Lamport-Clock", "X-Consistency-Mode", "X-DB-Read-Latency-Ms", "X-Served-By-Node"],
-)
+app.add_middleware(CORSMiddleware, **auth.cors_settings())
 
 _lock = threading.Lock()
 _lamport_clock = 0
@@ -260,7 +254,8 @@ log_dns_resolution()
 @app.get("/discovery", response_model=DiscoveryResponse, tags=["Observabilidade"])
 def get_discovery(
     response: Response,
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    _admin: Optional[auth.User] = Depends(auth.require_admin),
 ):
     """
     FC-01: Descoberta de serviços, identidade de nó (URNs), resolução DNS e telemetria.
@@ -288,13 +283,17 @@ def get_discovery(
 async def create_rental(
     payload: RentalCreateRequest,
     response: Response,
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    user: Optional[auth.User] = Depends(auth.require_user),
 ):
     """
     FA-03 / FA-04 / FB-01: Cria uma nova locação atômica de jogo de tabuleiro.
     Elimina condição de corrida (double-booking) delegando a reserva em chamada atômica única
     ao catalog-service via POST /games/{id}/reserve.
     """
+    if user is not None and not user.is_admin:
+        # O locatário é quem está logado; o admin pode informar outro (ex.: simulador de disputa)
+        payload = payload.model_copy(update={"renter_email": user.email, "renter_name": payload.renter_name or user.name})
     clock = tick_lamport(x_lamport_clock)
     rental_id = str(uuid.uuid4())
     logger.info(f"[LAMPORT={clock}] Solicitação de aluguel: Jogo {payload.game_id} por {payload.renter_name} (Rental={rental_id})")
@@ -385,12 +384,15 @@ def list_rentals(
     renter_email: Optional[str] = Query(None, description="FB-02: Filtra locações pelo e-mail do locatário (Painel 'Meus Aluguéis')"),
     game_id: Optional[int] = Query(None, description="FB-02: Filtra histórico de locações pelo ID do jogo (Visão do Locador)"),
     status: Optional[RentalStatus] = Query(None, description="Filtra por status da locação (CONFIRMED, COMPLETED, CANCELLED)"),
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    user: Optional[auth.User] = Depends(auth.require_user),
 ):
     """
     FB-02: Consulta reservas registradas com suporte a filtros combináveis por locatário, jogo e status.
     Atende ao painel 'Meus Aluguéis' (Locatário) e ao histórico de locações (Locador).
     """
+    if user is not None and not user.is_admin:
+        renter_email = user.email  # cada locatário só vê as próprias locações
     clock = tick_lamport(x_lamport_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
     logger.info(f"[LAMPORT={clock}] Consulta de locações: renter_email={renter_email}, game_id={game_id}, status={status}")
@@ -399,8 +401,17 @@ def list_rentals(
     return [RentalResponse(**r) for r in records]
 
 
+def _ensure_owner(rental: dict, user: Optional[auth.User]) -> None:
+    """Com login ativo, só o locatário da reserva (ou um admin) pode vê-la ou devolvê-la."""
+    if user is None or user.is_admin:
+        return
+    if (rental.get("renter_email") or "").lower() != user.email:
+        # 404 em vez de 403: não revela que a locação existe
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Locação não encontrada.")
+
+
 @app.get("/rentals/{rental_id}", response_model=RentalResponse, tags=["Locações"])
-def get_rental(rental_id: str):
+def get_rental(rental_id: str, user: Optional[auth.User] = Depends(auth.require_user)):
     """Consulta detalhes de uma locação específica."""
     if rental_id not in RENTALS_DB:
         table = _get_ddb_table()
@@ -423,6 +434,7 @@ def get_rental(rental_id: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Locação com ID {rental_id} não encontrada."
         )
+    _ensure_owner(RENTALS_DB[rental_id], user)
     return RentalResponse(**RENTALS_DB[rental_id])
 
 
@@ -430,7 +442,8 @@ def get_rental(rental_id: str):
 async def return_rental(
     rental_id: str,
     response: Response,
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    user: Optional[auth.User] = Depends(auth.require_user),
 ):
     """
     FB-01 / FB-03: Finaliza a locação e comunica o catalog-service via /release para liberar o exemplar.
@@ -459,6 +472,7 @@ async def return_rental(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Locação com ID {rental_id} não encontrada.")
 
     rental = RENTALS_DB[rental_id]
+    _ensure_owner(rental, user)
     current_status = rental.get("status")
     if current_status == RentalStatus.COMPLETED or current_status == "COMPLETED":
         response.headers["X-Lamport-Clock"] = str(clock)
