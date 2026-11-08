@@ -9,6 +9,10 @@
 x-aws-managed: &aws-managed
   USE_DYNAMODB: "true"
   DYNAMODB_ENDPOINT_URL: ""
+  SQS_ENDPOINT_URL: ""
+  # Protege POST /games/{id}/release?force=true (exige o header X-Admin-Token).
+  # Defina antes de subir: export ADMIN_TOKEN=$(openssl rand -hex 16)
+  ADMIN_TOKEN: ${ADMIN_TOKEN:-}
 
 services:
   catalog-service:

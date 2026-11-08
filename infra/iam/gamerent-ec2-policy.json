@@ -17,6 +17,24 @@
       "Resource": "*"
     },
     {
+      "Sid": "SQSCriarFila",
+      "Effect": "Allow",
+      "Action": "sqs:CreateQueue",
+      "Resource": "*"
+    },
+    {
+      "Sid": "SQSFilaGameRent",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:GetQueueUrl",
+        "sqs:SendMessage",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:GetQueueAttributes"
+      ],
+      "Resource": "arn:aws:sqs:sa-east-1:*:gamerent_*"
+    },
+    {
       "Sid": "Route53SemRecursoEspecifico",
       "Effect": "Allow",
       "Action": [

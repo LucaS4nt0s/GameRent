@@ -56,3 +56,29 @@ docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
 
 O override [`docker-compose.aws.yml`](../docker-compose.aws.yml) zera `DYNAMODB_ENDPOINT_URL` e liga
 `USE_DYNAMODB=true`, então os serviços passam a usar o DynamoDB real em `sa-east-1`.
+
+### 3. Token de administrador
+
+A liberação forçada de um jogo (`POST /games/{id}/release?force=true`) ignora a locação ativa, então na
+EC2 ela deve ficar protegida. Defina `ADMIN_TOKEN` antes de subir a stack:
+
+```bash
+export ADMIN_TOKEN=$(openssl rand -hex 16)
+docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
+```
+
+Com o token definido, a chamada exige o header `X-Admin-Token`. Os scripts de teste o enviam
+automaticamente quando `ADMIN_TOKEN` está no ambiente.
+
+Na AWS (DynamoDB gerenciado, sem `DYNAMODB_ENDPOINT_URL`), se `ADMIN_TOKEN` não estiver definido a
+liberação forçada é **recusada com 403**. No desenvolvimento local com DynamoDB Local ela continua
+aberta para não quebrar os testes, e o catálogo registra um aviso no log.
+
+### 4. Mensageria Amazon SQS
+
+O `rental-service` conversa com o `catalog-service` por **Amazon SQS**. A IAM Role permite criar as
+filas `gamerent_*`, enviar, receber e apagar mensagens; nenhuma URL ou chave de acesso fica no código.
+No ambiente local o `docker-compose.yml` sobe `softwaremill/elasticmq-native` (`sqs-local`); na AWS o
+`SQS_ENDPOINT_URL` fica vazio e o boto3 usa a região `sa-east-1` com as credenciais da Instance Profile.
+As duas réplicas do catálogo consomem a mesma fila (competing consumers), e a exclusão mútua é garantida
+pelas escritas condicionais no DynamoDB.

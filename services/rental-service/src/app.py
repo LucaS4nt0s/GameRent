@@ -43,6 +43,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Lamport-Clock", "X-Consistency-Mode", "X-DB-Read-Latency-Ms", "X-Served-By-Node"],
 )
 
 _lock = threading.Lock()
@@ -473,11 +474,24 @@ async def return_rental(
         )
         resp_clock = release_data.get("lamport_clock")
         clock = tick_lamport(resp_clock)
+    except GameConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+            headers={"X-Lamport-Clock": str(clock)}
+        )
+    except GameNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+            headers={"X-Lamport-Clock": str(clock)}
+        )
     except Exception as exc:
         logger.error(f"Erro ao liberar jogo {rental['game_id']} no catálogo: {exc}")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Não foi possível liberar o jogo no catálogo: {exc}"
+            detail=f"Não foi possível liberar o jogo no catálogo: {exc}",
+            headers={"X-Lamport-Clock": str(clock)}
         )
 
     rental["status"] = RentalStatus.COMPLETED

@@ -1,5 +1,9 @@
 """Self-check para Issue #13 (FA-02: Busca Geográfica com Filtros e Seletor de Consistência)."""
 import json
+import os
+import subprocess
+import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -21,28 +25,58 @@ def req(path: str) -> tuple[int, dict, dict | list]:
         return e.code, headers, json.loads(e.read().decode("utf-8"))
 
 
+def ensure_service():
+    try:
+        with urllib.request.urlopen(f"{BASE}/health", timeout=1) as resp:
+            if resp.status == 200:
+                return None
+    except Exception:
+        pass
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src_dir = os.path.join(base_dir, "services", "catalog-service", "src")
+    p = subprocess.Popen([sys.executable, "app.py"], cwd=src_dir)
+    for _ in range(15):
+        try:
+            with urllib.request.urlopen(f"{BASE}/health", timeout=1) as resp:
+                if resp.status == 200:
+                    break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return p
+
+
 if __name__ == "__main__":
-    # 1. GET /games com filtros opcionais (status_filter, category, owner_id) e consistência
-    status, headers, items = req("/games?status_filter=AVAILABLE&category=Estrat%C3%A9gia&owner_id=locador-001&consistency=eventual")
-    assert status == 200, f"Esperado 200, obtido {status}"
-    assert headers.get("x-consistency-mode") == "eventual"
-    assert "x-db-read-latency-ms" in headers
-    assert len(items) >= 1 and all(g["owner_id"] == "locador-001" and g["status"] == "AVAILABLE" for g in items)
-    assert REQUIRED_FIELDS.issubset(items[0].keys())
-    assert items[0]["consistency_mode"] == "eventual"
-    assert "latitude" not in items[0] and "longitude" not in items[0]
+    proc = ensure_service()
+    try:
+        # 1. GET /games com filtros opcionais (status_filter, category, owner_id) e consistência
+        status, headers, items = req("/games?status_filter=AVAILABLE&category=Estrat%C3%A9gia&owner_id=locador-001&consistency=eventual")
+        assert status == 200, f"Esperado 200, obtido {status}"
+        assert headers.get("x-consistency-mode") == "eventual"
+        assert "x-db-read-latency-ms" in headers
+        assert len(items) >= 1 and all(g["owner_id"] == "locador-001" and g["status"] == "AVAILABLE" for g in items)
+        assert REQUIRED_FIELDS.issubset(items[0].keys())
+        assert items[0]["consistency_mode"] == "eventual"
+        assert "latitude" not in items[0] and "longitude" not in items[0]
 
-    # 2. GET /games/nearby ordenado por distance_km, sem expor GPS, com filtros e consistência
-    s_near, h_near, near = req("/games/nearby?lat=-23.5505&lon=-46.6333&max_km=10&status_filter=AVAILABLE&consistency=strong")
-    assert s_near == 200 and h_near.get("x-consistency-mode") == "strong"
-    dists = [g["distance_km"] for g in near]
-    assert dists == sorted(dists), f"Distâncias fora de ordem: {dists}"
-    assert all(REQUIRED_FIELDS.issubset(g.keys()) and "latitude" not in g and "longitude" not in g for g in near)
+        # 2. GET /games/nearby ordenado por distance_km, sem expor GPS, com filtros e consistência
+        s_near, h_near, near = req("/games/nearby?lat=-23.5505&lon=-46.6333&max_km=10&status_filter=AVAILABLE&consistency=strong")
+        assert s_near == 200 and h_near.get("x-consistency-mode") == "strong"
+        dists = [g["distance_km"] for g in near]
+        assert dists == sorted(dists), f"Distâncias fora de ordem: {dists}"
+        assert all(REQUIRED_FIELDS.issubset(g.keys()) and "latitude" not in g and "longitude" not in g for g in near)
 
-    # 3. GET /games/{id} com consistency=strong e consistency=eventual
-    s_g1, h_g1, g1 = req("/games/1?consistency=strong")
-    assert s_g1 == 200 and g1["consistency_mode"] == "strong" and REQUIRED_FIELDS.issubset(g1.keys())
-    s_g1_ev, h_g1_ev, g1_ev = req("/games/1?consistency=eventual")
-    assert s_g1_ev == 200 and g1_ev["consistency_mode"] == "eventual" and "x-db-read-latency-ms" in h_g1_ev
+        # 3. GET /games/{id} com consistency=strong e consistency=eventual
+        s_g1, h_g1, g1 = req("/games/1?consistency=strong")
+        assert s_g1 == 200 and g1["consistency_mode"] == "strong" and REQUIRED_FIELDS.issubset(g1.keys())
+        s_g1_ev, h_g1_ev, g1_ev = req("/games/1?consistency=eventual")
+        assert s_g1_ev == 200 and g1_ev["consistency_mode"] == "eventual" and "x-db-read-latency-ms" in h_g1_ev
 
-    print("OK: Todos os critérios de aceite da Issue #13 validados!")
+        print("OK: Todos os critérios de aceite da Issue #13 validados!")
+    finally:
+        if proc:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
