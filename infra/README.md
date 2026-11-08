@@ -56,3 +56,17 @@ docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
 
 O override [`docker-compose.aws.yml`](../docker-compose.aws.yml) zera `DYNAMODB_ENDPOINT_URL` e liga
 `USE_DYNAMODB=true`, então os serviços passam a usar o DynamoDB real em `sa-east-1`.
+
+### 3. Token de administrador
+
+A liberação forçada de um jogo (`POST /games/{id}/release?force=true`) ignora a locação ativa, então na
+EC2 ela deve ficar protegida. Defina `ADMIN_TOKEN` antes de subir a stack:
+
+```bash
+export ADMIN_TOKEN=$(openssl rand -hex 16)
+docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
+```
+
+Com o token definido, a chamada exige o header `X-Admin-Token`. Os scripts de teste o enviam
+automaticamente quando `ADMIN_TOKEN` está no ambiente. Sem o token (desenvolvimento local), a liberação
+forçada continua aberta e o catálogo registra um aviso no log.

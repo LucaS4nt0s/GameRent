@@ -228,13 +228,32 @@ def _get_ddb_table():
         return None
 
 
-def _put_ddb_game(table, game: Game) -> None:
+def _put_ddb_game(table, game: Game, condition: Optional[dict] = None) -> None:
+    """Grava o item; `condition` = kwargs extras do put_item (ConditionExpression etc.)."""
     item = {**game.model_dump(), "status": game.status.value}
     for k in ("price_per_day", "latitude", "longitude"):
         if k in item and item[k] is not None:
             item[k] = Decimal(str(item[k]))
     clean_item = {k: v for k, v in item.items() if v is not None}
-    table.put_item(Item=clean_item)
+    table.put_item(Item=clean_item, **(condition or {}))
+
+
+def _is_conditional_failure(exc: Exception) -> bool:
+    return "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc)
+
+
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN") or None
+if ADMIN_TOKEN is None:
+    logger.warning("ADMIN_TOKEN não definido: liberação forçada (force=true) aceita sem autenticação (modo de desenvolvimento).")
+
+
+def _authorize_forced_release(x_admin_token: Optional[str]) -> None:
+    """force=true ignora o rental_id ativo; com ADMIN_TOKEN definido, exige o header X-Admin-Token."""
+    if ADMIN_TOKEN is not None and x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Liberação forçada exige o header X-Admin-Token válido.",
+        )
 
 
 def _reserve_ddb_game(table, game_id: int, rental_id: str, renter_name: str, clock: int) -> bool:
@@ -428,17 +447,39 @@ def create_game(
     with _lock:
         table = _get_ddb_table()
         max_id = max(GAMES_DB.keys(), default=0)
-        if table is not None:
+        if table is None:
+            new_id = max_id + 1
+            game = Game(id=new_id, lamport_clock=clock, **payload.model_dump())
+            GAMES_DB[new_id] = game
+        else:
+            # O scan dá um palpite; a gravação condicional (attribute_not_exists) garante que duas
+            # réplicas nunca fiquem com o mesmo ID: quem perde a corrida tenta o próximo.
             try:
                 items = table.scan(ProjectionExpression="id").get("Items", [])
                 max_id = max(max_id, max([int(it["id"]) for it in items], default=0))
-            except Exception:
-                pass
-        new_id = max_id + 1
-        game = Game(id=new_id, lamport_clock=clock, **payload.model_dump())
-        GAMES_DB[new_id] = game
-    logger.info(f"[LAMPORT={clock}] Novo jogo cadastrado: ID={new_id}, URN={game.urn}")
-    return _save_game(game)
+            except Exception as exc:
+                logger.warning(f"Falha ao consultar maior ID no DynamoDB: {exc}")
+            game = None
+            for attempt in range(10):
+                candidate = Game(id=max_id + 1 + attempt, lamport_clock=clock, **payload.model_dump())
+                try:
+                    _put_ddb_game(table, candidate, {"ConditionExpression": "attribute_not_exists(id)"})
+                    game = candidate
+                    break
+                except Exception as exc:
+                    if not _is_conditional_failure(exc):
+                        raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"Falha ao persistir o jogo no DynamoDB: {exc}",
+                        )
+            if game is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Não foi possível reservar um ID livre para o jogo; tente novamente.",
+                )
+            GAMES_DB[game.id] = game
+    logger.info(f"[LAMPORT={clock}] Novo jogo cadastrado: ID={game.id}, URN={game.urn}")
+    return GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN)
 
 
 @app.get("/games", response_model=List[GamePublicResponse], tags=["Catálogo"])
@@ -529,11 +570,35 @@ def update_game_status(
                 detail=f"Transição inválida de '{game.status.value}' para '{payload.status.value}' no jogo '{game.title}'."
             )
 
+        expected_version = game.version
         game.status = payload.status
         game.version += 1
         game.lamport_clock = clock
         game.updated_at = datetime.now(timezone.utc).isoformat()
-    return _save_game(game)
+
+        table = _get_ddb_table()
+        if table is not None:
+            # Controle otimista: só grava se ninguém (outra réplica, uma reserva) mudou o item
+            # desde a leitura forte acima. Sem isso, o put_item sobrescreve uma reserva concorrente.
+            try:
+                _put_ddb_game(table, game, {
+                    "ConditionExpression": "#v = :expected",
+                    "ExpressionAttributeNames": {"#v": "version"},
+                    "ExpressionAttributeValues": {":expected": expected_version},
+                })
+            except Exception as exc:
+                _get_game_for_mutation(game_id)  # descarta a mudança local e recarrega o estado real
+                if _is_conditional_failure(exc):
+                    logger.warning(f"[LAMPORT={clock}] Conflito 409: jogo ID={game_id} mudou durante a atualização de status")
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"O jogo '{game.title}' foi alterado por outra operação; atualize e tente novamente.",
+                    )
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"Falha ao persistir o status no DynamoDB: {exc}",
+                )
+    return GamePublicResponse(**game.model_dump(), served_by_node=NODE_URN)
 
 
 @app.post("/games/{game_id}/reserve", response_model=GamePublicResponse, tags=["Catálogo"])
@@ -616,7 +681,8 @@ def release_game(
     response: Response,
     payload: Optional[GameReleaseRequest] = None,
     force: bool = Query(False, description="Liberação administrativa forçada ignorando validação de rental_id"),
-    x_lamport_clock: Optional[int] = Header(default=None)
+    x_lamport_clock: Optional[int] = Header(default=None),
+    x_admin_token: Optional[str] = Header(default=None),
 ):
     """
     FB-01: Liberação atômica de exemplar alugado.
@@ -628,6 +694,8 @@ def release_game(
     logger.info(f"[LAMPORT={clock}] Liberação de exemplar solicitada para o jogo ID={game_id}")
 
     is_forced = force or (payload.force if payload else False)
+    if is_forced:
+        _authorize_forced_release(x_admin_token)
 
     with _lock:
         game = _get_game_for_mutation(game_id)
@@ -664,7 +732,9 @@ def release_game(
         try:
             _release_ddb_game(table, game_id, payload.rental_id if payload else None, is_forced, clock)
         except Exception as exc:
-            if "ConditionalCheckFailedException" in str(type(exc)) or "ConditionalCheckFailedException" in str(exc):
+            if _is_conditional_failure(exc):
+                # A liberação local já foi aplicada acima: desfaz recarregando o estado real
+                _get_game_for_mutation(game_id)
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=f"Operação negada: o rental_id informado não corresponde à locação ativa do jogo '{game.title}'."
