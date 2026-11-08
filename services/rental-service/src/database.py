@@ -51,6 +51,8 @@ def _from_item(item: dict) -> dict:
     for k in ("game_id", "rental_days", "lamport_clock"):
         if k in item and item[k] is not None:
             item[k] = int(item[k])
+    if "returned_at" not in item:
+        item["returned_at"] = None
     return item
 
 

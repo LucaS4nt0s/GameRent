@@ -42,7 +42,7 @@ class CatalogClient:
     """
 
     def __init__(self, base_url: Optional[str] = None, timeout_seconds: float = 6.0):
-        self.base_url = base_url or os.getenv("CATALOG_SERVICE_URL", "http://catalog-service:8001")
+        self.base_url = base_url or os.getenv("CATALOG_SERVICE_URL", f"http://catalog.{naming.INTERNAL_DOMAIN}:8001")
         self.timeout = timeout_seconds
         self.endpoint = os.getenv("SQS_ENDPOINT_URL") or None
         self.region = os.getenv("AWS_REGION", "sa-east-1")
@@ -312,7 +312,11 @@ class CatalogClient:
             raise CatalogCommunicationError(f"Erro de comunicação ao consultar catálogo: {exc}")
 
     async def set_game_status(self, game_id: int, new_status: str, lamport_clock: Optional[int] = None) -> bool:
-        """Atualização de status via SQS ou HTTP com propagação de Lamport."""
+        """
+        [DEPRECADO / LEGADO — Issue #9]: Atualização de status via PATCH /games/{id}/status.
+        Substituído pelo fluxo atômico S2S direto via reserve_game() e release_game() para eliminar
+        condições de corrida (double-booking). Mantido apenas para compatibilidade retroativa.
+        """
         clk = lamport_clock if lamport_clock is not None else get_lamport_time()
         if self.use_sqs:
             res = await self._send_and_wait("set_status", {
