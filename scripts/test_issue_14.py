@@ -18,6 +18,8 @@ if hasattr(sys.stderr, "reconfigure"):
 
 CATALOG_URL = os.getenv("CATALOG_SERVICE_URL", "http://127.0.0.1:8001")
 RENTAL_URL = os.getenv("RENTAL_SERVICE_URL", "http://127.0.0.1:8002")
+# Com ADMIN_TOKEN definido nos serviços, a liberação forçada exige este header
+ADMIN_HEADERS = {"X-Admin-Token": os.environ["ADMIN_TOKEN"]} if os.getenv("ADMIN_TOKEN") else None
 
 
 def req(url: str, method: str = "GET", body: dict | None = None, headers: dict | None = None) -> tuple[int, dict, dict]:
@@ -90,7 +92,7 @@ def main():
 
         # 2. Teste Direto: POST /games/{id}/reserve (Catalog)
         print("\n[2/7] Testando Reserva Atomica direta no Catalog (POST /games/2/reserve)...")
-        req(f"{CATALOG_URL}/games/2/release?force=true", method="POST")
+        req(f"{CATALOG_URL}/games/2/release?force=true", method="POST", headers=ADMIN_HEADERS)
         s_res, g_res, h_res = req(
             f"{CATALOG_URL}/games/2/reserve",
             method="POST",
@@ -152,7 +154,7 @@ def main():
 
         # 5. Fluxo End-to-End: POST /rentals no Rental-Service (Aluguel Atomico Completo)
         print("\n[5/7] Testando Fluxo Integrado S2S (POST /rentals -> POST /games/1/reserve)...")
-        req(f"{CATALOG_URL}/games/1/release?force=true", method="POST")
+        req(f"{CATALOG_URL}/games/1/release?force=true", method="POST", headers=ADMIN_HEADERS)
         rental_payload = {
             "renter_name": "KauaN Santos",
             "renter_email": "kauan@gamerent.com",
