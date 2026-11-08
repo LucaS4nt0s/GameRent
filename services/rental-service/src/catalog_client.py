@@ -29,9 +29,10 @@ class GameNotFoundError(Exception):
 
 class GameConflictError(Exception):
     """Erro quando o jogo está indisponível ou já reservado (409 Conflict)."""
-    def __init__(self, message: str, status_code: int = 409):
+    def __init__(self, message: str, status_code: int = 409, lamport_clock: Optional[int] = None):
         super().__init__(message)
         self.status_code = status_code
+        self.lamport_clock = lamport_clock
 
 
 class CatalogClient:
@@ -166,7 +167,7 @@ class CatalogClient:
                 data["lamport_clock"] = resp["lamport_clock"]
             return data
         elif status_code == 409:
-            raise GameConflictError(resp.get("detail", "Jogo indisponível ou já reservado."))
+            raise GameConflictError(resp.get("detail", "Jogo indisponível ou já reservado."), lamport_clock=resp.get("lamport_clock"))
         elif status_code == 404:
             raise GameNotFoundError(resp.get("detail", "Jogo com ID informado não encontrado no catálogo."))
         else:
@@ -215,8 +216,10 @@ class CatalogClient:
                 return data
             elif response.status_code == 409:
                 err_detail = response.json().get("detail", "Jogo indisponível ou já reservado.")
+                resp_clock = response.headers.get("X-Lamport-Clock")
+                clk_resp = int(resp_clock) if resp_clock and resp_clock.isdigit() else None
                 logger.warning(f"Conflito 409 reportado pelo catálogo para jogo {game_id}: {err_detail}")
-                raise GameConflictError(err_detail)
+                raise GameConflictError(err_detail, lamport_clock=clk_resp)
             elif response.status_code == 404:
                 err_detail = response.json().get("detail", f"Jogo com ID {game_id} não encontrado.")
                 logger.warning(f"Jogo {game_id} não encontrado no catálogo: 404 Not Found")
@@ -264,8 +267,10 @@ class CatalogClient:
                 return data
             elif response.status_code == 409:
                 err_detail = response.json().get("detail", "Operação negada na liberação do jogo.")
+                resp_clock = response.headers.get("X-Lamport-Clock")
+                clk_resp = int(resp_clock) if resp_clock and resp_clock.isdigit() else None
                 logger.warning(f"Conflito 409 reportado pelo catálogo na liberação do jogo {game_id}: {err_detail}")
-                raise GameConflictError(err_detail)
+                raise GameConflictError(err_detail, lamport_clock=clk_resp)
             elif response.status_code == 404:
                 raise GameNotFoundError(f"Jogo {game_id} não encontrado no catálogo para liberação.")
             else:

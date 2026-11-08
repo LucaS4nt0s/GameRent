@@ -219,7 +219,8 @@ async def create_rental(
     if user is not None and not user.is_admin:
         # O locatário é quem está logado; o admin pode informar outro (ex.: simulador de disputa)
         payload = payload.model_copy(update={"renter_email": user.email, "renter_name": payload.renter_name or user.name})
-    clock = tick_lamport(x_lamport_clock)
+    incoming_clock = x_lamport_clock if x_lamport_clock is not None else payload.lamport_clock
+    clock = tick_lamport(incoming_clock)
     rental_id = str(uuid.uuid4())
     logger.info(f"[LAMPORT={clock}] Solicitação de aluguel: Jogo {payload.game_id} por {_log_safe(payload.renter_name)} (Rental={rental_id})")
 
@@ -233,7 +234,8 @@ async def create_rental(
             lamport_clock=clock
         )
     except GameConflictError as exc:
-        # Rejeição imediata com 409 Conflict
+        if getattr(exc, "lamport_clock", None) is not None:
+            clock = tick_lamport(exc.lamport_clock)
         logger.warning(f"[LAMPORT={clock}] Reserva rejeitada com 409 Conflict: {exc}")
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -400,6 +402,8 @@ async def return_rental(
         resp_clock = release_data.get("lamport_clock")
         clock = tick_lamport(resp_clock)
     except GameConflictError as exc:
+        if getattr(exc, "lamport_clock", None) is not None:
+            clock = tick_lamport(exc.lamport_clock)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(exc),

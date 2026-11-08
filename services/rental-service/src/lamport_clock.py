@@ -34,7 +34,10 @@ class LamportClock:
             if incoming_time is not None:
                 try:
                     inc = int(incoming_time)
-                    self._time = max(self._time, inc) + 1
+                    if 0 <= inc <= 9007199254740991:
+                        self._time = max(self._time, inc) + 1
+                    else:
+                        self._time += 1
                 except (ValueError, TypeError):
                     self._time += 1
             else:

@@ -498,6 +498,8 @@ def _core_reserve(game_id: int, rental_id: str, renter_name: str, clock: int) ->
         prev_rental = game.current_rental_id
         prev_renter = game.current_renter_name
         prev_ver = game.version
+        prev_clock = game.lamport_clock
+        prev_updated_at = game.updated_at
 
         game.status = GameStatus.RENTED
         game.current_rental_id = rental_id
@@ -517,6 +519,8 @@ def _core_reserve(game_id: int, rental_id: str, renter_name: str, clock: int) ->
                 game.current_rental_id = prev_rental
                 game.current_renter_name = prev_renter
                 game.version = prev_ver
+                game.lamport_clock = prev_clock
+                game.updated_at = prev_updated_at
             if is_conditional_failure(exc):
                 # Sincroniza estado real do DynamoDB em caso de disputa concorrente
                 _get_game_for_mutation(game_id)
@@ -550,12 +554,17 @@ def reserve_game(
     Garante exclusão mútua: se o jogo não estiver AVAILABLE, rejeita imediatamente com 409 Conflict.
     Suporta retentativas idempotentes para a mesma locação (mesmo rental_id).
     """
-    clock = tick_lamport(x_lamport_clock)
+    incoming_clock = x_lamport_clock if x_lamport_clock is not None else payload.lamport_clock
+    clock = tick_lamport(incoming_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
     logger.info(f"[LAMPORT={clock}] Tentativa de reserva atômica para o jogo ID={game_id} (Rental={_log_safe(payload.rental_id)}, Locatário={_log_safe(payload.renter_name)})")
     res = _core_reserve(game_id, payload.rental_id, payload.renter_name, clock)
     if res["status"] != 200:
-        raise HTTPException(status_code=res["status"], detail=res["detail"])
+        raise HTTPException(
+            status_code=res["status"],
+            detail=res["detail"],
+            headers={"X-Lamport-Clock": str(res.get("lamport_clock", clock))},
+        )
     return res["data"]
 
 
@@ -638,7 +647,8 @@ def release_game(
     Restaura status para AVAILABLE e limpa vínculos de locação ativa.
     Exige validação do rental_id da locação ativa para prevenir liberações desautorizadas.
     """
-    clock = tick_lamport(x_lamport_clock)
+    incoming_clock = x_lamport_clock if x_lamport_clock is not None else (payload.lamport_clock if payload else None)
+    clock = tick_lamport(incoming_clock)
     response.headers["X-Lamport-Clock"] = str(clock)
     logger.info(f"[LAMPORT={clock}] Liberação de exemplar solicitada para o jogo ID={game_id}")
 
@@ -650,7 +660,11 @@ def release_game(
     rental_id = payload.rental_id if payload else None
     res = _core_release(game_id, rental_id, is_forced, clock)
     if res["status"] != 200:
-        raise HTTPException(status_code=res["status"], detail=res["detail"])
+        raise HTTPException(
+            status_code=res["status"],
+            detail=res["detail"],
+            headers={"X-Lamport-Clock": str(res.get("lamport_clock", clock))},
+        )
     return res["data"]
 
 
