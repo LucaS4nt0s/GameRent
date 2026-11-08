@@ -158,6 +158,29 @@ GAMES_DB: dict[int, Game] = {
     )
 }
 
+# Acervo de Poços de Caldas (MG). IDs a partir de 101 para não colidir com jogos cadastrados pelos
+# locadores; coordenadas aproximadas dos bairros (só o servidor as vê, o cliente recebe a distância).
+_POCOS = [
+    (101, "Carcassonne", "Monte cidades, estradas e mosteiros peça por peça. Ótimo para 2 a 5 pessoas.",
+     "Família", 14.0, "locador-pc-001", "Fernanda Lima", -21.7880, -46.5617),        # Centro
+    (102, "Azul", "Crie o mosaico mais bonito do palácio com azulejos coloridos.",
+     "Estratégia", 15.0, "locador-pc-001", "Fernanda Lima", -21.7880, -46.5617),     # Centro
+    (103, "Codenames", "Duas equipes, pistas de uma palavra e muita risada. Ideal para grupos.",
+     "Festa", 10.0, "locador-pc-002", "Rafael Prado", -21.7983, -46.5590),           # Jardim dos Estados
+    (104, "Splendor", "Negocie gemas e conquiste a nobreza do Renascimento.",
+     "Estratégia", 13.0, "locador-pc-002", "Rafael Prado", -21.7983, -46.5590),      # Jardim dos Estados
+    (105, "Wingspan", "Atraia aves para a sua reserva em um jogo calmo e lindo de ver.",
+     "Estratégia", 22.0, "locador-pc-003", "Juliana Ribeiro", -21.7740, -46.5560),   # Country Club
+    (106, "Dobble", "Rápido e divertido: ache o símbolo repetido antes de todo mundo.",
+     "Infantil", 8.0, "locador-pc-003", "Juliana Ribeiro", -21.7845, -46.5726),      # Vila Cruz
+]
+for _id, _title, _desc, _cat, _price, _owner_id, _owner, _lat, _lon in _POCOS:
+    GAMES_DB[_id] = Game(
+        id=_id, title=_title, description=_desc, category=_cat, price_per_day=_price,
+        status=GameStatus.AVAILABLE, owner_id=_owner_id, owner_name=_owner, latitude=_lat, longitude=_lon,
+    )
+SEED_GAMES: dict[int, Game] = dict(GAMES_DB)
+
 # ponytail: scan/get_item com ConsistentRead e filtro Haversine em memória; usar GeoIndex/GSI se acervo crescer >10k itens
 _ddb_table = None
 
@@ -204,15 +227,23 @@ def _get_ddb_table():
             table = ddb.Table(name)
         table.wait_until_exists()
         items = table.scan().get("Items", [])
-        if not items:
-            for g in GAMES_DB.values():
-                _put_ddb_game(table, g)
-        else:
-            for it in items:
-                try:
-                    GAMES_DB[int(it["id"])] = Game(**it)
-                except Exception:
-                    pass
+        existing_ids = set()
+        for it in items:
+            try:
+                GAMES_DB[int(it["id"])] = Game(**it)
+                existing_ids.add(int(it["id"]))
+            except Exception:
+                pass
+        # Semeia só o que falta (ex.: tabela criada antes do acervo de Poços de Caldas), sem
+        # sobrescrever estado existente: a condição garante isso mesmo com duas réplicas subindo juntas.
+        for game_id, g in SEED_GAMES.items():
+            if game_id in existing_ids:
+                continue
+            try:
+                _put_ddb_game(table, g, {"ConditionExpression": "attribute_not_exists(id)"})
+            except Exception as exc:
+                if not _is_conditional_failure(exc):
+                    raise
         _ddb_table = table
         return _ddb_table
     except Exception as exc:

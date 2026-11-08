@@ -28,6 +28,8 @@ function Shell() {
   const [renting, setRenting] = useState(null)
   const [busy, setBusy] = useState(false)
   const [refreshKey, setRefreshKey] = useState(0)
+  const [myRentals, setMyRentals] = useState([])
+  const [returning, setReturning] = useState('')
   const [toasts, setToasts] = useState([])
   const toastId = useRef(0)
 
@@ -36,6 +38,45 @@ function Shell() {
     setToasts((list) => [...list, { id, text, kind }])
     setTimeout(() => setToasts((list) => list.filter((t) => t.id !== id)), kind === 'error' ? 7000 : 4500)
   }, [])
+
+  // Locações em andamento do usuário: o card do jogo e o cabeçalho mostram "com você" e o botão Devolver
+  useEffect(() => {
+    if (!user) {
+      setMyRentals([])
+      return undefined
+    }
+    let stopped = false
+    let timer
+    const load = async () => {
+      if (!document.hidden) {
+        try {
+          const data = await api.rental.listRentals({ renterEmail: user.email, status: 'CONFIRMED' })
+          if (!stopped) setMyRentals(data.items.filter((r) => r.status === 'CONFIRMED'))
+        } catch {
+          // mantém a última lista; o erro aparece nas próprias telas
+        }
+      }
+      if (!stopped) timer = setTimeout(load, 5000)
+    }
+    load()
+    return () => {
+      stopped = true
+      clearTimeout(timer)
+    }
+  }, [user, refreshKey])
+
+  async function giveBack(rental) {
+    setReturning(rental.rental_id)
+    try {
+      await api.rental.returnRental(rental.rental_id)
+      notify(`Devolução de ${displayTitle(rental.game_title)} registrada. Obrigado!`)
+      setRefreshKey((k) => k + 1)
+    } catch (err) {
+      notify(err.message, 'error')
+    } finally {
+      setReturning('')
+    }
+  }
 
   // Volta para o aluguel pendente depois do login
   useEffect(() => {
@@ -105,13 +146,23 @@ function Shell() {
       </main>
     )
   } else {
-    page = <Home loc={loc} onRent={setRenting} refreshKey={refreshKey} />
+    page = (
+      <Home
+        loc={loc}
+        onRent={setRenting}
+        refreshKey={refreshKey}
+        myRentals={myRentals}
+        onReturn={giveBack}
+        returning={returning}
+      />
+    )
   }
 
   return (
     <div className={`app ${variant === 'admin' ? 'admin' : ''}`}>
       <Header
         user={user}
+        withYou={myRentals.length}
         cityLabel={loc.location.label}
         onLogout={() => {
           navigate('/')

@@ -3,11 +3,12 @@ import Reveal from './Reveal.jsx'
 import { Icon } from './Brand.jsx'
 import { brl, displayTitle, km, ownerShort } from '../utils/format.js'
 
-export default function GameCard({ game, featured = false, delay = 0, onRent }) {
+export default function GameCard({ game, featured = false, delay = 0, onRent, myRental, onReturn, returning = '' }) {
   const title = displayTitle(game.title)
   const available = game.status === 'AVAILABLE'
+  const withMe = Boolean(myRental)
   return (
-    <Reveal as="article" className={`game ${featured ? 'feature' : ''} ${available ? '' : 'out'}`} delay={delay}>
+    <Reveal as="article" className={`game ${featured ? 'feature' : ''} ${available || withMe ? '' : 'out'} ${withMe ? 'mine' : ''}`} delay={delay}>
       <div className="art">
         <GameImage game={game} title={title} />
         {game.distance_km !== undefined && (
@@ -15,7 +16,11 @@ export default function GameCard({ game, featured = false, delay = 0, onRent }) 
             <Icon id="pin" />a {km(game.distance_km)}
           </span>
         )}
-        {!available && <span className="state">{game.status === 'RENTED' ? 'Alugado' : 'Em pausa'}</span>}
+        {withMe ? (
+          <span className="state mine">Com você</span>
+        ) : (
+          !available && <span className="state">{game.status === 'RENTED' ? 'Alugado' : 'Em pausa'}</span>
+        )}
       </div>
       <div className="game-b">
         <h3>{title}</h3>
@@ -27,9 +32,20 @@ export default function GameCard({ game, featured = false, delay = 0, onRent }) 
           <span className="price">
             {brl(game.price_per_day)} <small>/dia</small>
           </span>
-          <button className="rent" type="button" disabled={!available} onClick={() => onRent(game)}>
-            {available ? 'Alugar' : 'Indisponível'}
-          </button>
+          {withMe ? (
+            <button
+              className="rent give-back"
+              type="button"
+              disabled={returning === myRental.rental_id}
+              onClick={() => onReturn(myRental)}
+            >
+              {returning === myRental.rental_id ? 'Devolvendo…' : 'Devolver'}
+            </button>
+          ) : (
+            <button className="rent" type="button" disabled={!available} onClick={() => onRent(game)}>
+              {available ? 'Alugar' : 'Indisponível'}
+            </button>
+          )}
         </div>
       </div>
     </Reveal>

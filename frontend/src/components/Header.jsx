@@ -12,7 +12,7 @@ export function goToSection(id) {
   }
 }
 
-export default function Header({ user, cityLabel, onLogout, variant = 'light' }) {
+export default function Header({ user, withYou = 0, cityLabel, onLogout, variant = 'light' }) {
   const [scrolled, setScrolled] = useState(false)
   const [menu, setMenu] = useState(false)
   const menuRef = useRef(null)
@@ -62,6 +62,11 @@ export default function Header({ user, cityLabel, onLogout, variant = 'light' })
               <span className="lbl">{cityLabel}</span>
             </button>
           )}
+          {user && withYou > 0 && variant !== 'admin' && (
+            <a className="with-you" href="#/conta" title="Jogos que estão com você — devolva por aqui">
+              Com você <b>{withYou}</b>
+            </a>
+          )}
           {user ? (
             <div className="user-menu" ref={menuRef}>
               <button className="avatar-btn" type="button" onClick={() => setMenu((m) => !m)} aria-expanded={menu} aria-haspopup="menu">
@@ -75,7 +80,7 @@ export default function Header({ user, cityLabel, onLogout, variant = 'light' })
                     <small>{user.email}</small>
                   </div>
                   <button role="menuitem" type="button" onClick={() => go('/conta')}>
-                    Minhas locações
+                    Minhas locações{withYou > 0 ? ` (${withYou} com você)` : ''}
                   </button>
                   <button role="menuitem" type="button" onClick={() => go('/conta/jogos')}>
                     Meus jogos anunciados

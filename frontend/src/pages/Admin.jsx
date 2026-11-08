@@ -346,6 +346,19 @@ function Inventory({ games, meta, reload, notify }) {
       notify(err.message, 'error')
     }
   }
+  async function endRental(game) {
+    if (!game.current_rental_id) {
+      notify('Esse jogo está alugado, mas o catálogo não informa qual locação. Use a liberação forçada.', 'error')
+      return
+    }
+    try {
+      await api.rental.returnRental(game.current_rental_id)
+      notify(`Locação de "${game.title}" encerrada e jogo liberado.`)
+      await reload()
+    } catch (err) {
+      notify(err.message, 'error')
+    }
+  }
   return (
     <div className="panel">
       {meta && (
@@ -384,7 +397,11 @@ function Inventory({ games, meta, reload, notify }) {
                 <td className="mono">{g.version}</td>
                 <td className="mono">{g.lamport_clock}</td>
                 <td>
-                  {g.status !== 'RENTED' && (
+                  {g.status === 'RENTED' ? (
+                    <button type="button" className="link-btn" onClick={() => endRental(g)}>
+                      Encerrar locação
+                    </button>
+                  ) : (
                     <button type="button" className="link-btn" onClick={() => toggle(g)}>
                       {g.status === 'MAINTENANCE' ? 'Liberar' : 'Manutenção'}
                     </button>

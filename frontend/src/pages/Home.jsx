@@ -10,7 +10,7 @@ import { navigate } from '../router.js'
 
 const POLL_MS = 5000
 
-export default function Home({ loc, onRent, refreshKey }) {
+export default function Home({ loc, onRent, refreshKey, myRentals = [], onReturn, returning = '' }) {
   const { location } = loc
   const [radius, setRadius] = useState(10)
   const [games, setGames] = useState([])
@@ -134,7 +134,16 @@ export default function Home({ loc, onRent, refreshKey }) {
         {shown.length > 0 && (
           <div className="grid">
             {shown.map((game, i) => (
-              <GameCard key={game.id} game={game} featured={i === 0 && shown.length >= 4} delay={(i % 4) * 0.07} onRent={onRent} />
+              <GameCard
+                key={game.id}
+                game={game}
+                featured={i === 0 && shown.length >= 4}
+                delay={(i % 4) * 0.07}
+                onRent={onRent}
+                myRental={myRentals.find((r) => r.game_id === game.id)}
+                onReturn={onReturn}
+                returning={returning}
+              />
             ))}
           </div>
         )}

@@ -33,6 +33,7 @@ export const CITIES = [
   ['Belo Horizonte', 'MG', -19.9167, -43.9345],
   ['Uberlândia', 'MG', -18.9128, -48.2755],
   ['Juiz de Fora', 'MG', -21.7642, -43.3496],
+  ['Poços de Caldas', 'MG', -21.7878, -46.5614],
   ['Vitória', 'ES', -20.3155, -40.3128],
   ['Curitiba', 'PR', -25.4284, -49.2733],
   ['Londrina', 'PR', -23.3045, -51.1696],
