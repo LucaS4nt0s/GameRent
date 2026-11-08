@@ -9,6 +9,8 @@ from urllib.parse import urlparse, urlunparse
 
 import boto3
 
+import auth
+
 logger = logging.getLogger("rental-service.catalog-client")
 
 
@@ -126,6 +128,8 @@ class CatalogClient:
             "reply_to": self.resp_queue_url,
             "action": action,
             "payload": payload,
+            # Autentica a mensagem no consumidor (catalog-service), espelhando require_service_or_admin.
+            "service_token": auth.SERVICE_TOKEN,
         }
 
         try:

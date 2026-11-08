@@ -72,6 +72,23 @@ def _secret_matches(given: Optional[str], expected: Optional[str]) -> bool:
     return bool(given) and bool(expected) and hmac.compare_digest(given, expected)
 
 
+def verify_service_token(given: Optional[str]) -> bool:
+    """True se ``given`` corresponde ao ``SERVICE_TOKEN`` (ou se ``SERVICE_TOKEN`` não está definido).
+
+    Espelha ``require_service_or_admin`` para a mensageria: quando o segredo compartilhado está
+    configurado, mensagens inter-serviços (SQS) precisam trazê-lo no corpo. Sem ``SERVICE_TOKEN``
+    a fila fica aberta apenas em desenvolvimento (mesma postura das rotas HTTP internas).
+    """
+    if SERVICE_TOKEN is None:
+        return True
+    return _secret_matches(given, SERVICE_TOKEN)
+
+
+def verify_admin_token(given: Optional[str]) -> bool:
+    """True se ``given`` corresponde ao ``ADMIN_TOKEN`` (False se ``ADMIN_TOKEN`` não está definido)."""
+    return _secret_matches(given, ADMIN_TOKEN)
+
+
 def verify_cognito_token(token: str) -> User:
     """Valida um id_token do Cognito e devolve o usuário. Lança HTTP 401 se inválido."""
     global _jwks_client
@@ -172,6 +189,8 @@ def cors_settings() -> dict:
     """
     raw = os.getenv("CORS_ORIGINS", "*")
     origins = [o.strip() for o in raw.split(",") if o.strip()] or ["*"]
+    if origins == ["*"]:
+        logger.warning("CORS_ORIGINS='*' permite qualquer origem; restrinja CORS_ORIGINS em produção.")
     return {
         "allow_origins": origins,
         "allow_credentials": False,
