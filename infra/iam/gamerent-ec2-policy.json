@@ -17,10 +17,15 @@
       "Resource": "*"
     },
     {
+      "Sid": "SQSCriarFila",
+      "Effect": "Allow",
+      "Action": "sqs:CreateQueue",
+      "Resource": "*"
+    },
+    {
       "Sid": "SQSFilaGameRent",
       "Effect": "Allow",
       "Action": [
-        "sqs:CreateQueue",
         "sqs:GetQueueUrl",
         "sqs:SendMessage",
         "sqs:ReceiveMessage",

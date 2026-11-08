@@ -71,7 +71,7 @@ services:
     environment:
       <<: *aws-env
       INSTANCE_ID: catalog-2
-      ENABLE_SQS_CONSUMER: "false"
+      ENABLE_SQS_CONSUMER: "true"
     depends_on:
       - dynamodb-local
       - sqs-local

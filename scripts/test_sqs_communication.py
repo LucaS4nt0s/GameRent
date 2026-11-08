@@ -4,18 +4,23 @@ Testa o fluxo completo de reserva, exclusão mútua e devolução via mensageria
 """
 
 import json
+import os
 import sys
 import time
 import urllib.error
 import urllib.request
 
-CATALOG_URL = "http://localhost:8001"
-RENTAL_URL = "http://localhost:8002"
+CATALOG_URL = os.getenv("CATALOG_SERVICE_URL", "http://localhost:8001")
+RENTAL_URL = os.getenv("RENTAL_SERVICE_URL", "http://localhost:8002")
+ADMIN_HEADERS = {"X-Admin-Token": os.environ["ADMIN_TOKEN"]} if os.getenv("ADMIN_TOKEN") else None
 
 
-def req(url: str, method: str = "GET", body: dict = None) -> tuple[int, dict]:
+def req(url: str, method: str = "GET", body: dict = None, headers: dict | None = None) -> tuple[int, dict]:
     data = json.dumps(body).encode("utf-8") if body else None
-    r = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
+    h = {"Content-Type": "application/json"}
+    if headers:
+        h.update(headers)
+    r = urllib.request.Request(url, data=data, method=method, headers=h)
     try:
         with urllib.request.urlopen(r, timeout=10) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
@@ -34,7 +39,7 @@ def main():
     print(f"✅ Health checks OK: Catalog (relógio={c_data['lamport_clock']}), Rental (relógio={r_data['lamport_clock']})")
 
     # Garante que o jogo 1 está livre
-    req(f"{CATALOG_URL}/games/1/release?force=true", method="POST")
+    req(f"{CATALOG_URL}/games/1/release?force=true", method="POST", headers=ADMIN_HEADERS)
 
     # 2. Criação de aluguel via Rental -> SQS -> Catalog
     print("\n[1/4] Testando criação de locação via mensagem Amazon SQS...")
