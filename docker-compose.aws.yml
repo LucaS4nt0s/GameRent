@@ -10,6 +10,9 @@ x-aws-managed: &aws-managed
   USE_DYNAMODB: "true"
   DYNAMODB_ENDPOINT_URL: ""
   SQS_ENDPOINT_URL: ""
+  # Liga o Amazon SQS gerenciado (região sa-east-1, credenciais da IAM Role). Sem isso o
+  # rental-service voltava a chamar o catálogo por HTTP e o aluguel dependia do Route 53.
+  USE_SQS: "true"
   # Protege POST /games/{id}/release?force=true (exige o header X-Admin-Token).
   # Defina antes de subir: export ADMIN_TOKEN=$(openssl rand -hex 16)
   ADMIN_TOKEN: ${ADMIN_TOKEN:-}
@@ -44,4 +47,6 @@ services:
   rental-service:
     environment:
       <<: *aws-managed
-      CATALOG_SERVICE_URL: "http://catalog.gamerent.internal:8001"
+      # Nome do Route 53 (infra/setup_route53.sh). Sem a zona privada, use
+      # CATALOG_SERVICE_URL=http://catalog-service:8001 no .env (DNS interno do Docker).
+      CATALOG_SERVICE_URL: ${CATALOG_SERVICE_URL:-http://catalog.gamerent.internal:8001}

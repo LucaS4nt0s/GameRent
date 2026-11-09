@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev, main]
+
+jobs:
+  frontend:
+    name: Front-end (build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run build
+
+  backend:
+    name: Serviços (testes)
+    runs-on: ubuntu-latest
+    # O rental-service fala com o catálogo por SQS: os testes usam o ElasticMQ como fila local
+    services:
+      sqs:
+        image: softwaremill/elasticmq-native:latest
+        ports:
+          - 9324:9324
+    env:
+      SQS_ENDPOINT_URL: http://localhost:9324
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r services/catalog-service/requirements.txt -r services/rental-service/requirements.txt
+      - run: python -m compileall -q services scripts
+      - name: Regras de acesso (Cognito simulado)
+        run: python scripts/test_auth.py
+      - name: Bateria da Entrega 3
+        # Filas próprias: o rental-service do passo anterior ainda pode estar desligando e
+        # consumir (e apagar) respostas da fila compartilhada, derrubando a reserva vencedora.
+        env:
+          CATALOG_REQUESTS_QUEUE_NAME: ci_e3_catalog_requests
+          RENTAL_RESPONSES_QUEUE_NAME: ci_e3_rental_responses
+        run: python scripts/test_entrega3.py
+
+  compose:
+    name: Docker Compose (config)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Local
+        run: docker compose -f docker-compose.yml config -q
+      - name: AWS (com valores de exemplo)
+        run: |
+          cp .env.example .env
+          sed -i 's/^COGNITO_CLIENT_ID=$/COGNITO_CLIENT_ID=exemplo/; s/^VITE_COGNITO_DOMAIN=$/VITE_COGNITO_DOMAIN=exemplo.auth.sa-east-1.amazoncognito.com/; s/^SERVICE_TOKEN=$/SERVICE_TOKEN=exemplo/' .env
+          docker compose -f docker-compose.yml -f docker-compose.aws.yml config -q

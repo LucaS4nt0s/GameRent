@@ -93,5 +93,5 @@ Para desenvolver só o front contra outra stack: `CATALOG_TARGET=http://localhos
 
 * **Provedor:** Amazon Web Services (AWS)
 * **Serviço de Computação:** AWS EC2 (t3.micro / Ubuntu Server)
-* **Endereço Público:** `http://18.231.180.197:8001` e `http://18.231.180.197:8002`
+* **Endereço Público:** `http://18.231.180.197:8001`, `http://18.231.180.197:8002` e o site em `http://18.231.180.197:8080` (atrás do CloudFront, veja `infra/README.md`, seção 6)
 

@@ -405,7 +405,7 @@ button:disabled {
 
 .story-copy {
   position: relative;
-  height: 320px;
+  height: 100%;
 }
 
 .phase {
@@ -415,6 +415,11 @@ button:disabled {
   transform: translateY(24px);
   transition: opacity 0.5s var(--ease), transform 0.6s var(--ease);
   pointer-events: none;
+  /* centraliza cada frase na altura do desenho da caixa */
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: flex-start;
 }
 
 .phase.on {
@@ -449,7 +454,7 @@ button:disabled {
 .phase h2 {
   font-family: Fraunces, serif;
   font-weight: 600;
-  font-size: clamp(40px, 5.4vw, 72px);
+  font-size: clamp(40px, 4.8vw, 66px);
   line-height: 0.98;
   letter-spacing: -0.03em;
   margin: 14px 0 18px;
@@ -678,7 +683,7 @@ button:disabled {
 .search-band {
   position: relative;
   z-index: 5;
-  padding: 84px 0 40px;
+  padding: 8px 0 40px;
 }
 
 .search-card {
@@ -2460,7 +2465,11 @@ button:disabled {
   }
 
   .story-copy {
-    height: 250px;
+    height: 270px;
+  }
+
+  .phase {
+    justify-content: flex-start;
   }
 
   .phase h1,
