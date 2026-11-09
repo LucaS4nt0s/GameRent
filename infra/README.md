@@ -142,3 +142,51 @@ No ambiente local o `docker-compose.yml` sobe `softwaremill/elasticmq-native` (`
 As duas réplicas do catálogo consomem a mesma fila (competing consumers), e a exclusão mútua é garantida
 pelas escritas condicionais no DynamoDB.
 
+
+### 6. CloudFront na frente da EC2 (HTTPS)
+
+O Cognito só aceita callback `https` fora de `localhost`, e a EC2 serve HTTP. O CloudFront resolve isso:
+o navegador fala HTTPS com o CloudFront, e ele busca o site na EC2 por HTTP.
+
+**Origem (EC2):**
+
+| Campo | Valor |
+|---|---|
+| Origin domain | DNS público da EC2. Use um **Elastic IP**: sem ele o endereço muda a cada stop/start e o CloudFront passa a dar 504 |
+| Protocol | **HTTP only** (a EC2 não tem certificado; "HTTPS only" ou "Match viewer" dá 504) |
+| HTTP port | `80`, com `FRONTEND_PORT=80` no `.env` (ou `8080` se mantiver a porta padrão) |
+
+**Security Group da EC2:** libere a porta da origem para a lista de prefixos gerenciada
+`com.amazonaws.global.cloudfront.origin-facing`. Se a regra estiver só com "Meu IP", o site abre para quem
+criou a regra (acesso direto pelo IP) e dá **504 para todo mundo pelo CloudFront**.
+
+**Comportamentos (behaviors):**
+
+| Caminho | Cache policy | Origin request policy | Métodos |
+|---|---|---|---|
+| `/api/*` | `CachingDisabled` | `AllViewerExceptHostHeader` (repassa o `Authorization` com o token do Cognito) | GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE |
+| padrão (`*`) | `CachingOptimized` | nenhuma | GET, HEAD |
+
+Viewer protocol policy: *Redirect HTTP to HTTPS*. O nginx já manda `no-cache` no `index.html`, cache longo
+em `/assets/` (arquivos com hash) e `no-store` nas respostas da API.
+
+Depois de criar a distribuição, use `https://<id>.cloudfront.net/` em `VITE_COGNITO_REDIRECT_URI`,
+`CORS_ORIGINS` e nas *Allowed callback/sign-out URLs* do App client do Cognito.
+
+**504 Gateway Timeout:** o CloudFront não alcançou a EC2. Confira, nesta ordem: endereço da origem
+atualizado, protocolo HTTP only, porta igual à do `FRONTEND_PORT`, Security Group liberando o CloudFront e
+`docker compose ps` com tudo `healthy`. Um teste rápido: `curl -I http://<ip-da-ec2>:<porta>/` de fora da AWS.
+
+### 7. Atualizar o deploy
+
+Na primeira vez, o [`user_data_ec2.sh`](user_data_ec2.sh) instala tudo e clona o repositório em
+`/opt/gamerent` (branch padrão, `main`). Crie o `.env` a partir de [`.env.example`](../.env.example) e, para
+cada nova versão:
+
+```bash
+cd /opt/gamerent && sudo bash infra/deploy.sh
+```
+
+O script baixa a `main`, reconstrói as imagens, sobe a stack e espera os healthchecks de todos os serviços
+(catálogo, locações e front-end). Se algo não ficar saudável em 3 minutos, ele mostra os últimos logs e sai
+com erro. Os logs dos containers têm rotação (10 MB × 3 arquivos por serviço).
