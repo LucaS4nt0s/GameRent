@@ -294,13 +294,13 @@ export default function BoxStory({ cityLabel, onFindGames }) {
                     <circle cx="168" cy="114" r="5" />
                   </g>
                   <text x="28" y="52" fontFamily="Fraunces, serif" fontWeight="600" fontSize="34" fill="#F3EDE2">
-                    Ilha das
+                    Exploding
                   </text>
                   <text x="28" y="88" fontFamily="Fraunces, serif" fontStyle="italic" fontSize="38" fill="#F3EDE2">
-                    Lanternas
+                    Kittens
                   </text>
                   <text x="30" y="198" fontFamily="Instrument Sans" fontWeight="600" fontSize="10" fill="#F3EDE2" letterSpacing="3" opacity=".7">
-                    2–6 JOGADORES · 30 MIN
+                    2–5 JOGADORES · 15 MIN
                   </text>
                 </g>
               </svg>
