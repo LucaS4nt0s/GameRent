@@ -59,10 +59,13 @@ class CatalogClient:
         self._worker_thread = None
 
         if self.use_sqs:
+            # O ElasticMQ local aceita qualquer credencial; na AWS (sem endpoint) deixamos o boto3
+            # usar a cadeia padrão (IAM Role da EC2). Chaves fictícias ali sobrepõem a role e a AWS
+            # recusa com InvalidClientTokenId.
             creds = {
                 "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "local"),
                 "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "local"),
-            }
+            } if self.endpoint else {}
             self.sqs = boto3.client("sqs", endpoint_url=self.endpoint, region_name=self.region, **creds)
             self._worker_thread = threading.Thread(target=self._response_worker, daemon=True)
             self._worker_thread.start()
