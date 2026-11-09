@@ -44,6 +44,11 @@ jobs:
       - name: Regras de acesso (Cognito simulado)
         run: python scripts/test_auth.py
       - name: Bateria da Entrega 3
+        # Filas próprias: o rental-service do passo anterior ainda pode estar desligando e
+        # consumir (e apagar) respostas da fila compartilhada, derrubando a reserva vencedora.
+        env:
+          CATALOG_REQUESTS_QUEUE_NAME: ci_e3_catalog_requests
+          RENTAL_RESPONSES_QUEUE_NAME: ci_e3_rental_responses
         run: python scripts/test_entrega3.py
 
   compose:
