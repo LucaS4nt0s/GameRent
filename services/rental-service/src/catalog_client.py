@@ -59,10 +59,12 @@ class CatalogClient:
         self._worker_thread = None
 
         if self.use_sqs:
+            # Chaves fictícias só para a fila local (ElasticMQ). Na AWS, sem endpoint, o boto3 usa a
+            # IAM Role da instância; passar "local"/"local" ali dava InvalidClientTokenId no SQS.
             creds = {
                 "aws_access_key_id": os.getenv("AWS_ACCESS_KEY_ID", "local"),
                 "aws_secret_access_key": os.getenv("AWS_SECRET_ACCESS_KEY", "local"),
-            }
+            } if self.endpoint else {}
             self.sqs = boto3.client("sqs", endpoint_url=self.endpoint, region_name=self.region, **creds)
             self._worker_thread = threading.Thread(target=self._response_worker, daemon=True)
             self._worker_thread.start()
