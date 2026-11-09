@@ -1,14 +1,105 @@
+# Ambiente local da Entrega 3:
+#   - dynamodb-local: Amazon DynamoDB rodando em container (sem custo de nuvem)
+#   - catalog-service + catalog-service-2: duas réplicas do catálogo apontando para a MESMA tabela,
+#     demonstrando estado compartilhado e coordenação distribuída
+#   - rental-service e frontend
+#
+# Para rodar contra o DynamoDB real da AWS (EC2 com IAM Role), use o override:
+#   docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
+
+x-aws-env: &aws-env
+  AWS_REGION: ${AWS_REGION:-sa-east-1}
+  AWS_DEFAULT_REGION: ${AWS_REGION:-sa-east-1}
+  DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+  SQS_ENDPOINT_URL: http://sqs-local:9324
+  GAMES_TABLE_NAME: gamerent_games
+  RENTALS_TABLE_NAME: gamerent_rentals
+  CATALOG_REQUESTS_QUEUE_NAME: gamerent_catalog_requests
+  RENTAL_RESPONSES_QUEUE_NAME: gamerent_rental_responses
+
+# Logs com rotação: evita encher o disco da EC2 com o tempo.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# /health dos serviços Python (a imagem python:3.11-slim não tem curl)
+x-health-catalog: &health-catalog
+  test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
+  interval: 15s
+  timeout: 5s
+  retries: 5
+  start_period: 20s
+
 services:
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.5.2
+    container_name: gamerent-dynamodb
+    # -sharedDb: todas as réplicas enxergam o mesmo banco, independente de região/credencial
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-inMemory"]
+    ports:
+      # Só na máquina local: o DynamoDB Local não tem autenticação
+      - "127.0.0.1:8000:8000"
+    networks:
+      - gamerent-net
+    restart: unless-stopped
+    logging: *logging
+
+  sqs-local:
+    image: softwaremill/elasticmq-native:latest
+    container_name: gamerent-sqs
+    ports:
+      - "127.0.0.1:9324:9324"
+    networks:
+      - gamerent-net
+    restart: unless-stopped
+    logging: *logging
+
+  # Réplica 1 do catálogo (porta 8001)
   catalog-service:
     build:
       context: ./services/catalog-service
       dockerfile: Dockerfile
-    container_name: gamerent-catalog
+    image: gamerent/catalog-service:local
+    container_name: gamerent-catalog-1
     ports:
       - "8001:8001"
+    environment:
+      <<: *aws-env
+      INSTANCE_ID: catalog-1
+      ENABLE_SQS_CONSUMER: "true"
+    healthcheck: *health-catalog
+    depends_on:
+      - dynamodb-local
+      - sqs-local
     networks:
       - gamerent-net
     restart: unless-stopped
+    logging: *logging
+
+  # Réplica 2 do catálogo (porta 8003) — mesma imagem, mesmo banco, outro INSTANCE_ID.
+  # Ainda NÃO entra no balanceamento do rental-service: PATCH /status e a geração de IDs usam o
+  # GAMES_DB em memória de cada réplica até a exclusão mútua no DynamoDB (#4/#7). Até lá ela serve
+  # para demonstrar leituras do estado compartilhado (http://localhost:8003).
+  catalog-service-2:
+    image: gamerent/catalog-service:local
+    container_name: gamerent-catalog-2
+    ports:
+      - "8003:8001"
+    environment:
+      <<: *aws-env
+      INSTANCE_ID: catalog-2
+      ENABLE_SQS_CONSUMER: "true"
+    healthcheck: *health-catalog
+    depends_on:
+      - dynamodb-local
+      - sqs-local
+      - catalog-service
+    networks:
+      - gamerent-net
+    restart: unless-stopped
+    logging: *logging
 
   rental-service:
     build:
@@ -18,26 +109,55 @@ services:
     ports:
       - "8002:8002"
     environment:
-      - CATALOG_SERVICE_URL=http://catalog-service:8001
+      <<: *aws-env
+      INSTANCE_ID: rental-1
+      CATALOG_SERVICE_URL: http://catalog-service:8001
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     depends_on:
-      - catalog-service
+      sqs-local:
+        condition: service_started
+      catalog-service:
+        condition: service_healthy
+      catalog-service-2:
+        condition: service_started
     networks:
       - gamerent-net
     restart: unless-stopped
+    logging: *logging
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        VITE_AUTH_PROVIDER: ${VITE_AUTH_PROVIDER:-local}
+        VITE_ADMIN_EMAILS: ${VITE_ADMIN_EMAILS:-}
+        VITE_COGNITO_DOMAIN: ${VITE_COGNITO_DOMAIN:-}
+        VITE_COGNITO_CLIENT_ID: ${VITE_COGNITO_CLIENT_ID:-}
+        VITE_COGNITO_REDIRECT_URI: ${VITE_COGNITO_REDIRECT_URI:-}
     container_name: gamerent-frontend
     ports:
-      - "8080:80"
+      # Na EC2 atrás do CloudFront use FRONTEND_PORT=80 (ver infra/README.md, "CloudFront")
+      - "${FRONTEND_PORT:-8080}:80"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
     depends_on:
-      - catalog-service
-      - rental-service
+      catalog-service:
+        condition: service_healthy
+      rental-service:
+        condition: service_healthy
     networks:
       - gamerent-net
     restart: unless-stopped
+    logging: *logging
 
 networks:
   gamerent-net:

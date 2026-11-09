@@ -1,0 +1,52 @@
+# Override para a EC2 na AWS (sa-east-1): usa o DynamoDB gerenciado em vez do dynamodb-local.
+# As credenciais vêm da IAM Role anexada à instância (Instance Profile) — nenhuma chave no código.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.aws.yml up -d --build
+#
+# CATALOG_SERVICE_URL usa o nome simbólico do Route 53 (issue #5). Provisione a zona privada
+# com infra/setup_route53.sh antes de subir a stack na EC2.
+
+x-aws-managed: &aws-managed
+  USE_DYNAMODB: "true"
+  DYNAMODB_ENDPOINT_URL: ""
+  SQS_ENDPOINT_URL: ""
+  # Liga o Amazon SQS gerenciado (região sa-east-1, credenciais da IAM Role). Sem isso o
+  # rental-service voltava a chamar o catálogo por HTTP e o aluguel dependia do Route 53.
+  USE_SQS: "true"
+  # Protege POST /games/{id}/release?force=true (exige o header X-Admin-Token).
+  # Defina antes de subir: export ADMIN_TOKEN=$(openssl rand -hex 16)
+  ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+  # Login real (ver infra/README.md, "Login com Amazon Cognito"). Obrigatórios em produção.
+  AUTH_PROVIDER: ${AUTH_PROVIDER:-cognito}
+  COGNITO_USER_POOL_ID: ${COGNITO_USER_POOL_ID:?defina COGNITO_USER_POOL_ID}
+  COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:?defina COGNITO_CLIENT_ID}
+  # Segredo das rotas internas rental -> catalog (/reserve, /release)
+  SERVICE_TOKEN: ${SERVICE_TOKEN:?defina SERVICE_TOKEN}
+  # Origens que podem chamar a API pelo navegador (ex.: http://<ip-publico>:8080)
+  CORS_ORIGINS: ${CORS_ORIGINS:-*}
+
+services:
+  frontend:
+    build:
+      args:
+        VITE_AUTH_PROVIDER: cognito
+        VITE_COGNITO_DOMAIN: ${VITE_COGNITO_DOMAIN:?defina VITE_COGNITO_DOMAIN}
+        VITE_COGNITO_CLIENT_ID: ${COGNITO_CLIENT_ID:?defina COGNITO_CLIENT_ID}
+        VITE_COGNITO_REDIRECT_URI: ${VITE_COGNITO_REDIRECT_URI:?defina VITE_COGNITO_REDIRECT_URI}
+
+  catalog-service:
+    environment:
+      <<: *aws-managed
+      INSTANCE_ID: ${CATALOG_1_INSTANCE_ID:-catalog-1}
+
+  catalog-service-2:
+    environment:
+      <<: *aws-managed
+      INSTANCE_ID: ${CATALOG_2_INSTANCE_ID:-catalog-2}
+
+  rental-service:
+    environment:
+      <<: *aws-managed
+      # Nome do Route 53 (infra/setup_route53.sh). Sem a zona privada, use
+      # CATALOG_SERVICE_URL=http://catalog-service:8001 no .env (DNS interno do Docker).
+      CATALOG_SERVICE_URL: ${CATALOG_SERVICE_URL:-http://catalog.gamerent.internal:8001}
