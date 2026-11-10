@@ -12,11 +12,7 @@
 - **Kauan Simão** — Middleware, APIs, Comunicação & Integração
 - **Maria Eduarda** — Infraestrutura, Nuvem AWS, Resiliência & Front-end
 
-> **Status deste documento:** rascunho estrutural. Os trechos marcados com **[EVIDÊNCIA PENDENTE]**
-> devem receber prints do console AWS e a saída de `scripts/test_entrega3.py` (issue #10) antes da
-> exportação para PDF (ver seção 9). Já estão em `dev`: reserva e liberação atômicas (#21), painel de
-> locações (#22) e `/discovery` com Lamport nos dois serviços (#24). Ainda em PRs abertos: infraestrutura
-> (#25), nomeação (#26) e as abas do aplicativo (#28). Revise o texto depois do merge de cada um.
+> Evidências coletadas em 09/11/2026. Os prints estão em `docs/diagrams/entrega-3/`.
 
 ---
 
@@ -90,8 +86,16 @@ A Entrega 3 ataca três blocos do conteúdo da disciplina:
   credenciais temporárias do Instance Profile. O override `docker-compose.aws.yml` desliga o endpoint
   local e passa a usar o DynamoDB gerenciado.
 
-> **[EVIDÊNCIA PENDENTE]** Print do IAM mostrando a role `GameRentEC2Role` anexada à instância e saída de
-> `aws sts get-caller-identity` executado dentro da EC2.
+**Evidência — IAM Role.** A role `GameRentEC2Role` existe no IAM com o serviço `ec2` como entidade
+confiável, e a coluna "Última atividade" mostra que ela foi assumida pela instância durante a coleta:
+
+![IAM — role GameRentEC2Role](diagrams/entrega-3/01-iam-role-gamerentec2role.png)
+
+Dentro da EC2, `aws sts get-caller-identity` mostra que a instância opera com as credenciais
+temporárias da role (`assumed-role/GameRentEC2Role/i-0c84218f0673dd699`), sem nenhuma chave de acesso
+configurada na máquina:
+
+![aws sts get-caller-identity na EC2](diagrams/entrega-3/02-ec2-sts-get-caller-identity.png)
 
 ---
 
@@ -153,11 +157,44 @@ concorrência exigiria relógios vetoriais. Os logs registram `[LAMPORT=n]` junt
 
 ### 3.4. Evidências
 
-> **[EVIDÊNCIA PENDENTE]** Saída de `scripts/test_entrega3.py`, teste de estresse: 10 reservas simultâneas
-> para `game_id=1` → **1 × 201 Created** e **9 × 409 Conflict** (CA-02).
+**Exclusão mútua (CA-02) — na AWS.** A bateria foi executada contra a stack da EC2, pelo CloudFront
+(`/api/catalog` e `/api/rental`). Dez `POST /rentals` simultâneos para o mesmo jogo resultaram em
+**1 × 201 Created** e **9 × 409 Conflict**. Logo depois, uma leitura forte do item mostra
+`status=RENTED`, `version=2` e o `lamport_clock` da escrita vencedora. O mesmo teste também confirmou o
+cadastro com URN sem expor GPS (FA-01), o relógio de Lamport (entrada 50 → saída 219) e o ciclo
+devolução → nova locação (FB-03):
 
-> **[EVIDÊNCIA PENDENTE]** Trecho dos logs do `rental-service` e do `catalog-service` mostrando
-> `[LAMPORT=n]` crescendo monotonicamente na mesma locação (CA-03).
+![Bateria de testes na AWS](diagrams/entrega-3/03b-teste-aws.webp)
+
+Como a rota `/reserve` não é exposta publicamente (o nginx responde 403), a disputa **entre as duas
+réplicas** do catálogo foi validada no ambiente Docker, com 10 reservas divididas entre `catalog-1` e
+`catalog-2`: **1 × 200 e 9 × 409**, com a vencedora decidida pela escrita condicional:
+
+![Bateria de testes local, com disputa entre réplicas](diagrams/entrega-3/03a-teste-local.webp)
+
+**Relógio de Lamport (CA-03).** Linha do tempo de duas locações, juntando os logs do `rental-service` e
+das duas réplicas do catálogo e ordenando pelo horário físico. O contador nunca diminui ao longo da
+cadeia solicitação → reserva → confirmação → liberação → finalização. O salto de 24 para 33 no
+`rental-service` corresponde às outras nove requisições da disputa, que avançaram o relógio no intervalo:
+
+![Logs com LAMPORT crescendo](diagrams/entrega-3/04-lamport-logs-local.webp)
+
+O print acima é do ambiente Docker local. O mesmo comportamento aparece na EC2, com o DynamoDB
+gerenciado e login Cognito: uma locação feita pelo site e depois devolvida gera a cadeia
+**47 → 48 → 49 → 58 → 59**, alternando entre os dois serviços. Cada mensagem recebida faz o relógio
+avançar para `max(L, L_msg) + 1`, por isso a reserva no catálogo (48) vem logo depois da solicitação no
+rental (47), e a confirmação no rental (49) vem logo depois da reserva:
+
+![Logs com LAMPORT crescendo na EC2](diagrams/entrega-3/04b-lamport-logs-ec2.png)
+
+Os logs do `rental-service` lidos com `docker compose logs` na EC2 mostram o mesmo padrão em outra
+locação (jogo 107): solicitação em `LAMPORT=4` e confirmação em `LAMPORT=6`, com as consultas seguintes
+avançando o contador. Às 22:41:38 o valor volta para 3 porque o container foi recriado num novo deploy:
+o relógio de Lamport fica em memória e recomeça a cada processo. A ordem causal continua garantida
+dentro de cada execução, e o `lamport_clock` gravado em cada item do DynamoDB preserva o valor de cada
+escrita:
+
+![Logs do rental-service via docker compose na EC2](diagrams/entrega-3/04c-lamport-docker-compose-logs.webp)
 
 ---
 
@@ -216,11 +253,30 @@ o esquema de URNs e a resolução de cada nome simbólico.
 
 ### 4.4. Evidências
 
-> **[EVIDÊNCIA PENDENTE]** Print do console Route 53 com a zona privada `gamerent.internal` e os registros
-> `catalog` / `rental`.
+**Route 53.** Zona privada `gamerent.internal` com os registros A `catalog.gamerent.internal` e
+`rental.gamerent.internal` apontando para o IP privado da EC2 (`172.31.33.87`):
 
-> **[EVIDÊNCIA PENDENTE]** Saída de `curl http://catalog.gamerent.internal:8001/discovery` executado na EC2
-> e trecho de log `[DNS] ... -> <IP privado>` (CA-04).
+![Route 53 — zona privada gamerent.internal](diagrams/entrega-3/05-route53-gamerent-internal.webp)
+
+**Resolução na EC2.** O painel de service discovery (seção 6), servido pela EC2, mostra o
+`catalog-service` resolvendo `catalog.gamerent.internal` para `172.31.33.87`, o mesmo IP do registro no
+Route 53:
+
+![Service discovery na EC2](diagrams/entrega-3/09b-admin-service-discovery.png)
+
+> **Observação.** No mesmo painel, o `rental-service` ainda aponta para `http://catalog-service:8001`
+> (DNS do Docker). O nome `catalog.gamerent.internal` só é usado pelo `rental-service` quando a stack sobe
+> com o override `docker-compose.aws.yml`, que não estava ativo na coleta.
+
+**Resolução pelo terminal da EC2 (CA-04).** `getent hosts` resolve `catalog.gamerent.internal` e
+`rental.gamerent.internal` para `172.31.33.87` pela zona privada. Um `curl` ao `/health` usando o nome
+simbólico chega ao `catalog-1`, e o log do serviço registra a tradução
+`[DNS] catalog.gamerent.internal -> 172.31.33.87`:
+
+![DNS interno resolvendo na EC2](diagrams/entrega-3/06-ec2-dns-catalog-gamerent-internal.png)
+
+O `/discovery` não aparece aqui porque, com o login Cognito ligado, ele exige uma conta de
+administrador. O mesmo conteúdo está no painel de service discovery acima.
 
 ---
 
@@ -266,18 +322,48 @@ cliente qual versão ele recebeu, e `served_by_node` mostra qual réplica respon
 
 ### 5.3. Evidências
 
-> **[EVIDÊNCIA PENDENTE]** Tabela comparativa de `scripts/test_entrega3.py` (CA-05):
->
-> | Modo      | Leituras | Latência média (ms) | p95 (ms) | Leituras desatualizadas após escrita |
-> |-----------|---------:|--------------------:|---------:|-------------------------------------:|
-> | strong    |          |                     |          |                                      |
-> | eventual  |          |                     |          |                                      |
+**Forte × eventual (CA-05).** Latência de leitura medida dentro do serviço (header
+`X-DB-Read-Latency-Ms`), 20 leituras alternadas de `GET /games` em cada modo:
 
-> **[EVIDÊNCIA PENDENTE]** Print das tabelas `gamerent_games` e `gamerent_rentals` no console do DynamoDB
-> (`sa-east-1`) com itens contendo `urn`, `version` e `lamport_clock`.
+| Ambiente                    | Modo     | Leituras | Latência média (ms) | p95 (ms) |
+|-----------------------------|----------|---------:|--------------------:|---------:|
+| EC2 (via CloudFront)        | strong   |       20 |                5,30 |     8,79 |
+| EC2 (via CloudFront)        | eventual |       20 |                4,97 |     7,73 |
+| Docker local                | strong   |       20 |               18,11 |    78,58 |
+| Docker local                | eventual |       20 |               15,51 |    65,64 |
 
-> **[EVIDÊNCIA PENDENTE]** CA-01: reiniciar os containers após uma locação e mostrar que o status `RENTED`
-> e o registro da locação continuam no DynamoDB.
+No comparador do site (5 leituras por modo), a diferença média foi de 0,09 ms a favor da leitura
+eventual (6,29 ms × 6,20 ms):
+
+![Comparador forte × eventual](diagrams/entrega-3/09c-admin-forte-eventual.png)
+
+Em todas as medições a leitura eventual foi um pouco mais rápida, como o PACELC prevê. A diferença é
+pequena porque o `Scan` lê poucos itens e o banco está na mesma região dos serviços.
+
+> **Observação.** O painel de discovery capturado às 18:11 de 09/11 indica `LOCAL_DYNAMODB` nos dois
+> serviços: naquele momento a EC2 ainda rodava com o container `dynamodb-local`, e os números da EC2
+> acima foram medidos nesse estado. O deploy seguinte, com `docker-compose.aws.yml`, passou a usar o
+> DynamoDB gerenciado (`USE_DYNAMODB=true`, sem endpoint local).
+
+**Tabelas no DynamoDB.** As tabelas `gamerent_games` (chave `id`) e `gamerent_rentals` (chave
+`rental_id`) estão ativas em `sa-east-1`. A coluna "Regiões de replicação" é 0 porque o projeto não usa
+Global Tables (replicação entre regiões). A replicação usada é a Multi-AZ, que o DynamoDB faz
+automaticamente dentro da região e não aparece como configuração no console:
+
+![Tabelas no console do DynamoDB](diagrams/entrega-3/07a-dynamodb-tabelas.png)
+
+Itens de `gamerent_games` com `lamport_clock`, `urn` e `version`. Jogos disputados várias vezes têm
+versões mais altas (Terraforming Mars em `version=11`, Dixit em `version=8`):
+
+![gamerent_games — lamport_clock](diagrams/entrega-3/07b-dynamodb-games-lamport.png)
+
+![gamerent_games — urn e version](diagrams/entrega-3/07c-dynamodb-games-urn-version.png)
+
+Itens de `gamerent_rentals` com `game_urn`, `lamport_clock`, `status` e `returned_at`:
+
+![gamerent_rentals — lamport_clock](diagrams/entrega-3/07d-dynamodb-rentals-lamport.webp)
+
+![gamerent_rentals — status](diagrams/entrega-3/07e-dynamodb-rentals-status.png)
 
 ---
 
@@ -309,9 +395,17 @@ recarregar a página.
 - **Comparador de consistência (bloco 6):** 5 leituras em cada modo, alternando a ordem, com a latência
   média de leitura do banco.
 
-> **[EVIDÊNCIA PENDENTE]** Prints das três abas: o simulador com 1 × 201 e 9 × 409, o painel de discovery
-> na EC2 resolvendo `catalog.gamerent.internal` e o comparador de consistência rodando contra o DynamoDB
-> da AWS.
+**Disputa concorrente** na EC2: 10 reservas do jogo `urn:gamerent:game:sa-east-1:1` → 1 × 201 (req #5) e
+9 × 409, com o Lamport de cada resposta indo de 29 a 39:
+
+![Laboratório — disputa concorrente](diagrams/entrega-3/09a-admin-disputa-concorrente.png)
+
+**Acervo técnico**, com URN, dono, status, versão e Lamport de cada jogo, lido em consistência forte e
+indicando a réplica que respondeu (`served_by_node`):
+
+![Laboratório — acervo técnico](diagrams/entrega-3/09d-admin-acervo-tecnico.webp)
+
+Os prints das abas **Service discovery** e **Forte × Eventual** estão nas seções 4.4 e 5.3.
 
 ---
 
@@ -330,8 +424,7 @@ recarregar a página.
 
 ## 8. Conclusão
 
-A Entrega 3 leva o GameRent de um protótipo com estado em memória para uma arquitetura em que (sujeito
-à validação dos critérios de aceite nas seções de evidências):
+A Entrega 3 leva o GameRent de um protótipo com estado em memória para uma arquitetura em que:
 
 - várias réplicas do catálogo operam sobre um armazenamento replicado e compartilhado;
 - a reserva de um exemplar é decidida por uma escrita condicional atômica, para evitar *double-booking*;
@@ -339,7 +432,18 @@ A Entrega 3 leva o GameRent de um protótipo com estado em memória para uma arq
 - recursos e nós têm nomes formais e estáveis, e os serviços se encontram por DNS, não por IP fixo;
 - o cliente escolhe entre consistência forte e eventual, conhecendo o custo em latência de cada uma.
 
-> **[PENDENTE]** Lições aprendidas e próximos passos (Entrega 4), após a coleta das evidências.
+**Lições aprendidas na implantação:**
+
+- **Configuração por ambiente precisa ser explícita.** Subir a EC2 só com o `docker-compose.yml` deixou
+  os serviços no `dynamodb-local`, sem Cognito e com o DNS do Docker. O override
+  `docker-compose.aws.yml` é que liga o DynamoDB gerenciado, o login e o Route 53, e o painel de discovery
+  foi o que mostrou a diferença.
+- **Credenciais fictícias não podem vazar para a AWS.** As chaves `local`/`local`, necessárias para o
+  ElasticMQ e o DynamoDB Local, sobrepunham a IAM Role quando passadas sem endpoint local, e todo aluguel
+  falhava com `InvalidClientTokenId` no SQS (corrigido no PR #38).
+- **O relógio de Lamport vive no processo.** Cada novo deploy recria os containers e o contador recomeça.
+  A ordem causal vale dentro de uma execução, e o valor gravado em cada item do DynamoDB fica como
+  registro permanente.
 
 ---
 
